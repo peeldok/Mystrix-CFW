@@ -133,7 +133,7 @@ static std::atomic<uint32_t> parsed_rx_packets{0};
 static std::atomic<uint32_t> usb_cb_invocations{0};
 static std::atomic<uint32_t> usb_cb_max_packets{0};
 static std::atomic<uint32_t> usb_cb_max_us{0};
-static std::atomic<uint64_t> usb_cb_total_us{0};
+static std::atomic<uint32_t> usb_cb_total_us{0};
 static std::atomic<uint32_t> usb_cb_empty{0};
 
 
@@ -586,7 +586,7 @@ static void midi_stats_task(void *) {
         const uint32_t cb_count = usb_cb_invocations.exchange(0, std::memory_order_relaxed);
         const uint32_t cb_max_packets = usb_cb_max_packets.exchange(0, std::memory_order_relaxed);
         const uint32_t cb_max_us = usb_cb_max_us.exchange(0, std::memory_order_relaxed);
-        const uint64_t cb_total_us = usb_cb_total_us.exchange(0, std::memory_order_relaxed);
+        const uint32_t cb_total_us = usb_cb_total_us.exchange(0, std::memory_order_relaxed);
         const uint32_t cb_empty = usb_cb_empty.exchange(0, std::memory_order_relaxed);
         ESP_LOGI("usb_sched",
             "callbacks=%lu/s packets_per_cb_max=%lu callback_max_us=%lu callback_avg_us=%lu empty=%lu rx_fifo=%u queue=%u core=%d usb_prio=%d parser_prio=%d",
