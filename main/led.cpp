@@ -43,6 +43,9 @@ static TaskHandle_t led_task_handle = nullptr;
 static esp_timer_handle_t led_pacing_timer = nullptr;
 static std::atomic<bool> led_rmt_busy{false};
 static std::atomic<uint32_t> led_completed_frames{0};
+static std::atomic<uint32_t> led_prepared_frames{0};
+static std::atomic<uint32_t> led_prepare_total_us{0};
+static std::atomic<uint32_t> led_tx_errors{0};
 static std::atomic<uint32_t> rmt_start_us{0};
 static std::atomic<uint32_t> rmt_duration_sum_us{0};
 static std::atomic<uint32_t> rmt_duration_max_us{0};
@@ -363,37 +366,11 @@ static void led_task(void *) {
     };
     int next_dma_frame = 0;
     int64_t last_start_us = 0;
-    int64_t stats_start_us = esp_timer_get_time();
-    uint32_t last_completed = 0;
-    uint32_t prepare_count = 0;
-    uint64_t prepare_total_us = 0;
-    uint32_t tx_errors = 0;
-
     for (;;) {
         // Notifications can come from MIDI updates, timer pacing, and RMT done.
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         int64_t now = esp_timer_get_time();
-        if (now - stats_start_us >= 1000000) {
-            const uint32_t done = led_completed_frames.load(std::memory_order_relaxed);
-            const uint32_t completed = done - last_completed;
-            const int64_t elapsed = now - stats_start_us;
-            const uint32_t sum_us = rmt_duration_sum_us.exchange(0, std::memory_order_relaxed);
-            const uint32_t max_us = rmt_duration_max_us.exchange(0, std::memory_order_relaxed);
-            const uint32_t samples = rmt_duration_samples.exchange(0, std::memory_order_relaxed);
-            ESP_LOGI(TAG, "PERF LED done_fps=%lu prepared=%lu avg_prepare_us=%lu rmt_avg_us=%lu rmt_max_us=%lu tx_err=%lu",
-                static_cast<unsigned long>((static_cast<uint64_t>(completed) * 1000000ULL) / elapsed),
-                static_cast<unsigned long>(prepare_count),
-                static_cast<unsigned long>(prepare_count ? prepare_total_us / prepare_count : 0),
-                static_cast<unsigned long>(samples ? sum_us / samples : 0),
-                static_cast<unsigned long>(max_us),
-                static_cast<unsigned long>(tx_errors));
-            last_completed = done;
-            prepare_count = 0;
-            prepare_total_us = 0;
-            tx_errors = 0;
-            stats_start_us = now;
-        }
 
         if (led_rmt_busy.load(std::memory_order_acquire) ||
             !led_dirty.load(std::memory_order_acquire)) {
@@ -414,8 +391,11 @@ static void led_task(void *) {
         if (!prepare_latest_frame(led_data[next_dma_frame], &midi_first_arrival_us)) {
             continue;
         }
-        ++prepare_count;
-        prepare_total_us += esp_timer_get_time() - prepare_start;
+        led_prepared_frames.fetch_add(1, std::memory_order_relaxed);
+        led_prepare_total_us.fetch_add(
+            static_cast<uint32_t>(esp_timer_get_time() - prepare_start),
+            std::memory_order_relaxed
+        );
 
         const uint32_t submit_us = static_cast<uint32_t>(esp_timer_get_time());
         const uint32_t prev_done_us = rmt_last_done_us.load(std::memory_order_relaxed);
@@ -449,13 +429,40 @@ static void led_task(void *) {
                 xSemaphoreGive(framebuffer_mutex);
             }
             led_dirty.store(true, std::memory_order_release);
-            ++tx_errors;
+            led_tx_errors.fetch_add(1, std::memory_order_relaxed);
             // Back off on RMT queue error instead of spinning.
             if (led_pacing_timer && !esp_timer_is_active(led_pacing_timer)) {
                 ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(led_pacing_timer, 1000));
             }
         }
     }
+}
+
+void led_perf_log_snapshot() {
+    static uint32_t last_completed = 0;
+    static int64_t last_us = esp_timer_get_time();
+    const int64_t now_us = esp_timer_get_time();
+    const int64_t elapsed = now_us - last_us;
+    if (elapsed <= 0) return;
+
+    const uint32_t done = led_completed_frames.load(std::memory_order_relaxed);
+    const uint32_t completed = done - last_completed;
+    const uint32_t prepared = led_prepared_frames.exchange(0, std::memory_order_relaxed);
+    const uint32_t prepare_sum = led_prepare_total_us.exchange(0, std::memory_order_relaxed);
+    const uint32_t rmt_sum = rmt_duration_sum_us.exchange(0, std::memory_order_relaxed);
+    const uint32_t rmt_max = rmt_duration_max_us.exchange(0, std::memory_order_relaxed);
+    const uint32_t rmt_samples = rmt_duration_samples.exchange(0, std::memory_order_relaxed);
+    const uint32_t errors = led_tx_errors.exchange(0, std::memory_order_relaxed);
+
+    ESP_LOGI(TAG, "PERF LED done_fps=%lu prepared=%lu avg_prepare_us=%lu rmt_avg_us=%lu rmt_max_us=%lu tx_err=%lu",
+        static_cast<unsigned long>((static_cast<uint64_t>(completed) * 1000000ULL) / elapsed),
+        static_cast<unsigned long>(prepared),
+        static_cast<unsigned long>(prepared ? prepare_sum / prepared : 0),
+        static_cast<unsigned long>(rmt_samples ? rmt_sum / rmt_samples : 0),
+        static_cast<unsigned long>(rmt_max),
+        static_cast<unsigned long>(errors));
+    last_completed = done;
+    last_us = now_us;
 }
 
 void led_init() {

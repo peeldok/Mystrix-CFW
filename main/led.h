@@ -34,3 +34,6 @@ uint32_t led_completed_frame_count();
 
 // Call only between led_begin_update() and led_end_update().
 void led_record_midi_arrival_unlocked(uint32_t arrival_us);
+
+// Called only from the low-priority metrics task (never from the LED task).
+void led_perf_log_snapshot();

@@ -128,6 +128,7 @@ static std::atomic<uint32_t> dropped_rx_packets{0};
 static std::atomic<uint32_t> received_rx_packets{0};
 static std::atomic<uint32_t> rx_queue_peak{0};
 static uint32_t dropped_tx_events = 0;
+static std::atomic<uint32_t> parsed_rx_packets{0};
 static constexpr uint32_t MIDI_PARSE_BATCH_LIMIT = 192;
 static constexpr int64_t MIDI_PARSE_BUDGET_US = 750;
 
@@ -435,46 +436,56 @@ static void process_usb_packet(uint8_t port, const uint8_t packet[4], uint32_t a
 
 static void midi_parser_task(void *) {
     UsbMidiPacket packet{};
-    uint32_t parsed_in_window = 0;
-    int64_t stats_start_us = esp_timer_get_time();
-    uint32_t last_drop_count = 0;
-
     for (;;) {
-        if (xQueueReceive(midi_rx_queue, &packet, pdMS_TO_TICKS(25)) == pdTRUE) {
-            const int64_t batch_start_us = esp_timer_get_time();
-            uint32_t processed = 0;
-            do {
-                perf_diag_midi_queue_wait(
-                    static_cast<uint32_t>(esp_timer_get_time()) - packet.arrival_us
-                );
-                process_usb_packet(packet.port, packet.data, packet.arrival_us);
-                ++processed;
-                // Limit processing time to avoid monopolizing core 1.
-                if (processed >= MIDI_PARSE_BATCH_LIMIT ||
-                    esp_timer_get_time() - batch_start_us >= MIDI_PARSE_BUDGET_US) {
-                    break;
-                }
-            } while (xQueueReceive(midi_rx_queue, &packet, 0) == pdTRUE);
-            flush_note_batch();
-            parsed_in_window += processed;
-        }
+        if (xQueueReceive(midi_rx_queue, &packet, portMAX_DELAY) != pdTRUE) continue;
 
+        const int64_t batch_start_us = esp_timer_get_time();
+        uint32_t processed = 0;
+        do {
+            perf_diag_midi_queue_wait(
+                static_cast<uint32_t>(esp_timer_get_time()) - packet.arrival_us
+            );
+            process_usb_packet(packet.port, packet.data, packet.arrival_us);
+            ++processed;
+            if (processed >= MIDI_PARSE_BATCH_LIMIT ||
+                esp_timer_get_time() - batch_start_us >= MIDI_PARSE_BUDGET_US) {
+                break;
+            }
+        } while (xQueueReceive(midi_rx_queue, &packet, 0) == pdTRUE);
+        flush_note_batch();
+        parsed_rx_packets.fetch_add(processed, std::memory_order_relaxed);
+    }
+}
+
+// All expensive diagnostics run on a separate low-priority task.
+// No UART output or ESP_LOGI occurs in the MIDI parser or LED refresh task.
+static void midi_stats_task(void *) {
+    TickType_t next = xTaskGetTickCount();
+    int64_t stats_start_us = esp_timer_get_time();
+    uint32_t last_drop_count = dropped_rx_packets.load(std::memory_order_relaxed);
+    for (;;) {
+        vTaskDelayUntil(&next, pdMS_TO_TICKS(1000));
         const int64_t now_us = esp_timer_get_time();
         const int64_t elapsed_us = now_us - stats_start_us;
-        if (elapsed_us >= 1000000) {
-            const uint32_t receive_count = received_rx_packets.exchange(0, std::memory_order_relaxed);
-            const uint32_t drop_count = dropped_rx_packets.load(std::memory_order_relaxed);
-            const uint32_t peak = rx_queue_peak.exchange(0, std::memory_order_relaxed);
-            ESP_LOGI(TAG, "PERF MIDI RX=%lu/s parsed=%lu/s peak=%lu/%u drops=%lu",
-                static_cast<unsigned long>((static_cast<uint64_t>(receive_count) * 1000000ULL) / elapsed_us),
-                static_cast<unsigned long>((static_cast<uint64_t>(parsed_in_window) * 1000000ULL) / elapsed_us),
-                static_cast<unsigned long>(peak), MIDI_RX_QUEUE_SIZE,
-                static_cast<unsigned long>(drop_count - last_drop_count));
-            last_drop_count = drop_count;
-            parsed_in_window = 0;
-            stats_start_us = now_us;
-            perf_diag_log_snapshot();
-        }
+        if (elapsed_us <= 0) continue;
+
+        const uint32_t receive_count =
+            received_rx_packets.exchange(0, std::memory_order_relaxed);
+        const uint32_t parse_count =
+            parsed_rx_packets.exchange(0, std::memory_order_relaxed);
+        const uint32_t drop_count = dropped_rx_packets.load(std::memory_order_relaxed);
+        const uint32_t peak = rx_queue_peak.exchange(0, std::memory_order_relaxed);
+        ESP_LOGI(TAG, "PERF MIDI RX=%lu/s parsed=%lu/s peak=%lu/%u drops=%lu cdc_log_drops=%lu",
+            static_cast<unsigned long>((static_cast<uint64_t>(receive_count) * 1000000ULL) / elapsed_us),
+            static_cast<unsigned long>((static_cast<uint64_t>(parse_count) * 1000000ULL) / elapsed_us),
+            static_cast<unsigned long>(peak), MIDI_RX_QUEUE_SIZE,
+            static_cast<unsigned long>(drop_count - last_drop_count),
+            static_cast<unsigned long>(cdc_debug_log_drops_take()));
+        last_drop_count = drop_count;
+        stats_start_us = now_us;
+
+        perf_diag_log_snapshot();
+        led_perf_log_snapshot();
     }
 }
 
@@ -545,5 +556,9 @@ void midi_init() {
         1
     );
 
-    ESP_LOGI(TAG, "Dual MIDI + CDC initialized: MIDI 1/2, Debug COM, VID=0xA006, PID=0x2E71");
+    const BaseType_t stats_created = xTaskCreatePinnedToCore(
+        midi_stats_task, "midi_stats", 4096, nullptr, 1, nullptr, 1
+    );
+    configASSERT(stats_created == pdPASS);
+    ESP_LOGI(TAG, "Dual MIDI + CDC asynchronous stats: MIDI 1/2 + debug COM");
 }

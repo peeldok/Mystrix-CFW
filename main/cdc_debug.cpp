@@ -2,6 +2,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <atomic>
 
 #include "esp_timer.h"
 #include "led.h"
@@ -25,7 +26,9 @@ struct LogLine {
 };
 
 QueueHandle_t log_queue = nullptr;
-vprintf_like_t old_vprintf = nullptr;
+// Normal USB debug messages must never print to synchronous 115200 baud UART
+// from the high-priority MIDI parser or LED refresh task.
+std::atomic<uint32_t> debug_log_drops{0};
 TaskHandle_t benchmark_task_handle = nullptr;
 
 // Triggered only by typing B into the debug COM port.
@@ -61,27 +64,20 @@ void benchmark_task(void *) {
 
 
 int async_debug_vprintf(const char *format, va_list args) {
-    // Keep UART log output intact (also useful for recovery/debugging).
-    va_list uart_args;
-    va_copy(uart_args, args);
-    const int result = old_vprintf ? old_vprintf(format, uart_args) : 0;
-    va_end(uart_args);
-
-    if (log_queue != nullptr) {
-        LogLine line{};
-        va_list format_args;
-        va_copy(format_args, args);
-        const int count = vsnprintf(line.text, sizeof(line.text), format, format_args);
-        va_end(format_args);
-        if (count > 0) {
-            line.len = static_cast<uint16_t>(
-                count < static_cast<int>(sizeof(line.text)) ? count : sizeof(line.text) - 1
-            );
-            // Never block the MIDI parser or RMT task if the PC cannot keep up.
-            xQueueSend(log_queue, &line, 0);
-        }
+    // Log formatting and a single zero-timeout queue enqueue are the only
+    // producer work. Never call vprintf()/printf()/UART from a real-time task:
+    // a 150-byte message at 115200 baud blocks for ~13ms by itself.
+    if (!log_queue) return 0;
+    LogLine line{};
+    const int count = vsnprintf(line.text, sizeof(line.text), format, args);
+    if (count <= 0) return count;
+    line.len = static_cast<uint16_t>(
+        count < static_cast<int>(sizeof(line.text)) ? count : sizeof(line.text) - 1
+    );
+    if (xQueueSend(log_queue, &line, 0) != pdTRUE) {
+        debug_log_drops.fetch_add(1, std::memory_order_relaxed);
     }
-    return result;
+    return count;
 }
 
 void cdc_debug_task(void *) {
@@ -135,8 +131,10 @@ void cdc_debug_init() {
         ESP_LOGE("cdc_debug", "Unable to create LED benchmark task");
     }
 
-    old_vprintf = esp_log_set_vprintf(async_debug_vprintf);
-    ESP_LOGI("cdc_debug", "CDC debug ready: type B to run 5-second LED-only benchmark (no MIDI playing)");
+    // ROM/boot logs remain available on UART before this point. Runtime ESP-IDF
+    // logs are routed only to the low-priority CDC worker to avoid UART stalls.
+    esp_log_set_vprintf(async_debug_vprintf);
+    ESP_LOGI("cdc_debug", "Async CDC diagnostics enabled: UART runtime mirroring OFF; B=LED-only benchmark");
 }
 
 void cdc_debug_rx_callback(int itf, cdcacm_event_t *event) {
@@ -154,4 +152,8 @@ void cdc_debug_rx_callback(int itf, cdcacm_event_t *event) {
             }
         }
     } while (got == sizeof(input));
+}
+
+uint32_t cdc_debug_log_drops_take() {
+    return debug_log_drops.exchange(0, std::memory_order_relaxed);
 }
