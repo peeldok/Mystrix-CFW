@@ -1,4 +1,5 @@
 #include "cdc_debug.h"
+#include "config.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -115,7 +116,7 @@ void cdc_debug_init() {
         return;
     }
     const BaseType_t created = xTaskCreatePinnedToCore(
-        cdc_debug_task, "cdc_debug", 4096, nullptr, 1, nullptr, 1
+        cdc_debug_task, "cdc_debug", 4096, nullptr, PRIO_CDC, nullptr, CPU_CDC
     );
     if (created != pdPASS) {
         ESP_LOGE("cdc_debug", "Unable to create CDC output task");
@@ -125,7 +126,7 @@ void cdc_debug_init() {
     }
 
     const BaseType_t bench_ok = xTaskCreatePinnedToCore(
-        benchmark_task, "led_bench", 4096, nullptr, 2, &benchmark_task_handle, 0
+        benchmark_task, "led_bench", 4096, nullptr, PRIO_BENCHMARK, &benchmark_task_handle, CPU_BENCHMARK
     );
     if (bench_ok != pdPASS) {
         ESP_LOGE("cdc_debug", "Unable to create LED benchmark task");

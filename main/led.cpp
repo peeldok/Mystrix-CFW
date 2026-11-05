@@ -514,9 +514,9 @@ void led_init() {
         "led_refresh",
         4096,
         nullptr,
-        5,
+        PRIO_LED,
         &led_task_handle,
-        0
+        CPU_LED
     );
     if (task_created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create LED refresh task");

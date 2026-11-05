@@ -129,6 +129,13 @@ static std::atomic<uint32_t> received_rx_packets{0};
 static std::atomic<uint32_t> rx_queue_peak{0};
 static uint32_t dropped_tx_events = 0;
 static std::atomic<uint32_t> parsed_rx_packets{0};
+// Per-callback timing, aggregated to reduce CPU use in the TinyUSB task.
+static std::atomic<uint32_t> usb_cb_invocations{0};
+static std::atomic<uint32_t> usb_cb_max_packets{0};
+static std::atomic<uint32_t> usb_cb_max_us{0};
+static std::atomic<uint64_t> usb_cb_total_us{0};
+static std::atomic<uint32_t> usb_cb_empty{0};
+
 
 // The recorder provided a 4s capture with precisely 8377 NoteOn + 8377 NoteOff.
 // Counters below let us distinguish a PC/USB delivery loss from a firmware
@@ -178,55 +185,97 @@ struct SysExState {
 
 static SysExState sysex_state[MIDI_PORT_COUNT]{};
 
-static void enqueue_rx_drop_oldest(const UsbMidiPacket &packet) {
-    if (!midi_rx_queue) return;
-
-    if (uxQueueSpacesAvailable(midi_rx_queue) == 0) {
-        UsbMidiPacket discarded{};
-        xQueueReceive(midi_rx_queue, &discarded, 0);
-        dropped_rx_packets.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (xQueueSend(midi_rx_queue, &packet, 0) == pdTRUE) {
-        received_rx_packets.fetch_add(1, std::memory_order_relaxed);
-        uint32_t size = static_cast<uint32_t>(uxQueueMessagesWaiting(midi_rx_queue));
-        uint32_t peak = rx_queue_peak.load(std::memory_order_relaxed);
-        while (size > peak && !rx_queue_peak.compare_exchange_weak(
-            peak, size, std::memory_order_relaxed)) {}
-    }
+// Only called in the TinyUSB task (CPU1), all counters are published
+// once per callback rather than issuing several atomics per MIDI message.
+static inline void atomic_update_max(
+    std::atomic<uint32_t> &value, uint32_t sample) {
+    uint32_t old = value.load(std::memory_order_relaxed);
+    while (old < sample && !value.compare_exchange_weak(
+        old, sample, std::memory_order_relaxed)) {}
 }
 
 extern "C" void tud_midi_rx_cb(uint8_t itf) {
-    if (itf >= MIDI_PORT_COUNT) return;
+    if (itf >= MIDI_PORT_COUNT || !midi_rx_queue) return;
 
+    const uint32_t start_us = static_cast<uint32_t>(esp_timer_get_time());
     UsbMidiPacket packet{};
     packet.port = itf;
+    // The callback is invoked for MIDI data already buffered by TinyUSB.
+    // Time each drained packet at the callback entry (not at the time
+    // after it has waited through dozens of earlier parser operations).
+    packet.arrival_us = start_us;
+
+    uint32_t accepted = 0;
+    uint32_t discarded = 0;
+    uint32_t note_on = 0;
+    uint32_t note_off = 0;
+    uint32_t other = 0;
+    uint32_t drained = 0;
 
     while (tud_midi_n_packet_read(itf, packet.data)) {
-        packet.arrival_us = static_cast<uint32_t>(esp_timer_get_time());
+        ++drained;
         const uint8_t cin = packet.data[0] & 0x0F;
         const uint8_t status_group = packet.data[1] & 0xF0;
         if ((cin == 0x08 || cin == 0x09) &&
             (status_group == 0x80 || status_group == 0x90)) {
-            // Publish the arrival timestamp BEFORE incrementing counters.
-            // This prevents a stats snapshot from seeing a new Note count
-            // with an old last-note timestamp during concurrent USB receive.
-            last_note_arrival_us.store(packet.arrival_us, std::memory_order_release);
             if (status_group == 0x90 && packet.data[3] != 0) {
-                raw_note_on.fetch_add(1, std::memory_order_relaxed);
+                ++note_on;
             } else {
-                raw_note_off.fetch_add(1, std::memory_order_relaxed);
-            }
-            if (itf == 0) {
-                note_packets_port0.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                note_packets_port1.fetch_add(1, std::memory_order_relaxed);
+                ++note_off;
             }
         } else {
-            raw_other_packets.fetch_add(1, std::memory_order_relaxed);
+            ++other;
         }
-        perf_diag_usb_arrival(packet.arrival_us);
-        enqueue_rx_drop_oldest(packet);
+
+        // A single no-wait send in the common case; do not query the queue
+        // capacity and occupancy for every single 4-byte USB MIDI packet.
+        if (xQueueSend(midi_rx_queue, &packet, 0) == pdTRUE) {
+            ++accepted;
+        } else {
+            // Preserve the existing overload behavior for compatibility.
+            // Overrun is explicitly counted; expanding the queue and FIFO
+            // should make this path extremely rare at realistic USB rates.
+            UsbMidiPacket dropped_packet{};
+            if (xQueueReceive(midi_rx_queue, &dropped_packet, 0) == pdTRUE) {
+                ++discarded;
+                if (xQueueSend(midi_rx_queue, &packet, 0) == pdTRUE) {
+                    ++accepted;
+                } else {
+                    ++discarded;
+                }
+            } else {
+                ++discarded;
+            }
+        }
     }
+
+    if (drained == 0) usb_cb_empty.fetch_add(1, std::memory_order_relaxed);
+    if (accepted) received_rx_packets.fetch_add(accepted, std::memory_order_relaxed);
+    if (discarded) dropped_rx_packets.fetch_add(discarded, std::memory_order_relaxed);
+    if (note_on || note_off) {
+        // Publish the arrival timestamp before the note counters, so the
+        // stats task cannot read a newer count with an old timestamp.
+        last_note_arrival_us.store(start_us, std::memory_order_release);
+        raw_note_on.fetch_add(note_on, std::memory_order_relaxed);
+        raw_note_off.fetch_add(note_off, std::memory_order_relaxed);
+        if (itf == 0) {
+            note_packets_port0.fetch_add(note_on + note_off, std::memory_order_relaxed);
+        } else {
+            note_packets_port1.fetch_add(note_on + note_off, std::memory_order_relaxed);
+        }
+    }
+    if (other) raw_other_packets.fetch_add(other, std::memory_order_relaxed);
+
+    if (accepted) {
+        const uint32_t occupancy = static_cast<uint32_t>(
+            uxQueueMessagesWaiting(midi_rx_queue));
+        atomic_update_max(rx_queue_peak, occupancy);
+    }
+    usb_cb_invocations.fetch_add(1, std::memory_order_relaxed);
+    atomic_update_max(usb_cb_max_packets, drained);
+    const uint32_t elapsed = static_cast<uint32_t>(esp_timer_get_time()) - start_us;
+    usb_cb_total_us.fetch_add(elapsed, std::memory_order_relaxed);
+    atomic_update_max(usb_cb_max_us, elapsed);
 }
 
 static void midi_send_3_to_port(uint8_t port, uint8_t status, uint8_t d1, uint8_t d2) {
@@ -488,6 +537,10 @@ static void midi_parser_task(void *) {
         const int64_t batch_start_us = esp_timer_get_time();
         uint32_t processed = 0;
         do {
+            // Drain statistics on the parser task instead of spending time in
+            // the high-priority TinyUSB callback. USB arrival timestamps stay
+            // those captured at the start of the actual receive callback.
+            perf_diag_usb_arrival(packet.arrival_us);
             perf_diag_midi_queue_wait(
                 static_cast<uint32_t>(esp_timer_get_time()) - packet.arrival_us
             );
@@ -529,6 +582,21 @@ static void midi_stats_task(void *) {
             static_cast<unsigned long>(cdc_debug_log_drops_take()));
         last_drop_count = drop_count;
         stats_start_us = now_us;
+
+        const uint32_t cb_count = usb_cb_invocations.exchange(0, std::memory_order_relaxed);
+        const uint32_t cb_max_packets = usb_cb_max_packets.exchange(0, std::memory_order_relaxed);
+        const uint32_t cb_max_us = usb_cb_max_us.exchange(0, std::memory_order_relaxed);
+        const uint64_t cb_total_us = usb_cb_total_us.exchange(0, std::memory_order_relaxed);
+        const uint32_t cb_empty = usb_cb_empty.exchange(0, std::memory_order_relaxed);
+        ESP_LOGI("usb_sched",
+            "callbacks=%lu/s packets_per_cb_max=%lu callback_max_us=%lu callback_avg_us=%lu empty=%lu rx_fifo=%u queue=%u core=%d usb_prio=%d parser_prio=%d",
+            static_cast<unsigned long>(cb_count),
+            static_cast<unsigned long>(cb_max_packets),
+            static_cast<unsigned long>(cb_max_us),
+            static_cast<unsigned long>(cb_count ? cb_total_us / cb_count : 0),
+            static_cast<unsigned long>(cb_empty),
+            MIDI_RX_FIFO_BYTES, MIDI_RX_QUEUE_SIZE,
+            CPU_USB, PRIO_USB, PRIO_MIDI_PARSER);
 
         perf_diag_log_snapshot();
         led_perf_log_snapshot();
@@ -616,6 +684,9 @@ void midi_init() {
     configASSERT(button_queue);
 
     tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    // On dual-core ESP32-S3 the default is already CPU1. Make core placement
+    // AND priority explicit: USB must drain bulk OUT packets before parser work.
+    tusb_cfg.task = TINYUSB_TASK_CUSTOM(8192, PRIO_USB, CPU_USB);
     tusb_cfg.phy.self_powered = false;
     tusb_cfg.phy.vbus_monitor_io = -1;
     tusb_cfg.descriptor.device = &usb_device_descriptor;
@@ -648,9 +719,9 @@ void midi_init() {
         "midi_parser",
         6144,
         nullptr,
-        3,
+        PRIO_MIDI_PARSER,
         nullptr,
-        1
+        CPU_MIDI_PARSER
     );
 
     xTaskCreatePinnedToCore(
@@ -658,14 +729,17 @@ void midi_init() {
         "midi_tx",
         3072,
         nullptr,
-        3,
+        PRIO_MIDI_TX,
         nullptr,
-        1
+        CPU_MIDI_TX
     );
 
     const BaseType_t stats_created = xTaskCreatePinnedToCore(
-        midi_stats_task, "midi_stats", 4096, nullptr, 1, nullptr, 1
+        midi_stats_task, "midi_stats", 4096, nullptr, PRIO_STATS, nullptr, CPU_STATS
     );
     configASSERT(stats_created == pdPASS);
-    ESP_LOGI(TAG, "Dual MIDI + CDC asynchronous stats: MIDI 1/2 + debug COM");
+    ESP_LOGI(TAG, "Dual MIDI+CDC: USB core%d/prio%d, parser core%d/prio%d, LED core%d/prio%d, FSR core%d/prio%d; FIFO RX=%u TX=%u, queue=%u",
+        CPU_USB, PRIO_USB, CPU_MIDI_PARSER, PRIO_MIDI_PARSER,
+        CPU_LED, PRIO_LED, CPU_FSR, PRIO_FSR,
+        MIDI_RX_FIFO_BYTES, MIDI_TX_FIFO_BYTES, MIDI_RX_QUEUE_SIZE);
 }

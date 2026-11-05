@@ -495,9 +495,9 @@ void fsr_start() {
         "fsr_240hz",
         6144,
         nullptr,
-        4,
+        PRIO_FSR,
         nullptr,
-        0
+        CPU_FSR
     );
 
     ESP_LOGI(TAG, "ULP FSR scanner started");

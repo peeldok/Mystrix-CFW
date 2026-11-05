@@ -1,4 +1,5 @@
 #include "boot_animation.h"
+#include "config.h"
 #include "led.h"
 
 #include <algorithm>
@@ -211,8 +212,8 @@ void boot_animation_start() {
         "boot_animation",
         4096,
         nullptr,
-        4,
+        PRIO_BOOT,
         nullptr,
-        0
+        CPU_BOOT
     );
 }
