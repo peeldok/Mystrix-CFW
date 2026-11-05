@@ -5,6 +5,7 @@
 
 #include "cfy.h"
 #include "config.h"
+#include "cdc_debug.h"
 #include "fsr.h"
 #include "led.h"
 #include "matrix.h"
@@ -17,6 +18,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "tinyusb.h"
+#include "tinyusb_cdc_acm.h"
 #include "tinyusb_default_config.h"
 #include "tusb.h"
 
@@ -28,31 +30,37 @@ static constexpr uint8_t MIDI1_EP_OUT = 0x01;
 static constexpr uint8_t MIDI1_EP_IN  = 0x81;
 static constexpr uint8_t MIDI2_EP_OUT = 0x02;
 static constexpr uint8_t MIDI2_EP_IN  = 0x82;
+static constexpr uint8_t CDC_EP_NOTIF = 0x83;
+static constexpr uint8_t CDC_EP_OUT = 0x04;
+static constexpr uint8_t CDC_EP_IN = 0x84;
 
 enum {
     ITF_NUM_MIDI1 = 0,
     ITF_NUM_MIDI1_STREAMING,
     ITF_NUM_MIDI2,
     ITF_NUM_MIDI2_STREAMING,
+    ITF_NUM_CDC_CONTROL,
+    ITF_NUM_CDC_DATA,
     ITF_NUM_TOTAL
 };
 
 static constexpr uint16_t USB_CONFIG_TOTAL_LEN =
     TUD_CONFIG_DESC_LEN +
     TUD_MIDI_DESC_LEN +
-    TUD_MIDI_DESC_LEN;
+    TUD_MIDI_DESC_LEN +
+    TUD_CDC_DESC_LEN;
 
 static const tusb_desc_device_t usb_device_descriptor = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = 0x0200,
-    .bDeviceClass       = 0x00,
-    .bDeviceSubClass    = 0x00,
-    .bDeviceProtocol    = 0x00,
+    .bDeviceClass       = TUSB_CLASS_MISC,
+    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0101,
+    .bcdDevice          = 0x0102,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,
@@ -84,6 +92,16 @@ static const uint8_t usb_configuration_descriptor[] = {
         MIDI2_EP_IN,
         64
     ),
+
+    TUD_CDC_DESCRIPTOR(
+        ITF_NUM_CDC_CONTROL,
+        6,
+        CDC_EP_NOTIF,
+        8,
+        CDC_EP_OUT,
+        CDC_EP_IN,
+        64
+    ),
 };
 
 static const char usb_langid[] = {0x09, 0x04};
@@ -94,6 +112,7 @@ static const char *usb_string_descriptors[] = {
     "Mystrix",
     "Mystrix (CFW)",
     "Mystrix (CFW)",
+    "Mystrix Debug CDC",
 };
 
 struct UsbMidiPacket {
@@ -478,6 +497,20 @@ void midi_init() {
         return;
     }
 
+    const tinyusb_config_cdcacm_t acm_cfg = {
+        .cdc_port = TINYUSB_CDC_ACM_0,
+        .callback_rx = nullptr,
+        .callback_rx_wanted_char = nullptr,
+        .callback_line_state_changed = nullptr,
+        .callback_line_coding_changed = nullptr,
+    };
+    const esp_err_t cdc_err = tinyusb_cdcacm_init(&acm_cfg);
+    if (cdc_err != ESP_OK) {
+        ESP_LOGE(TAG, "tinyusb_cdcacm_init failed: %s", esp_err_to_name(cdc_err));
+    } else {
+        cdc_debug_init();
+    }
+
     xTaskCreatePinnedToCore(
         midi_parser_task,
         "midi_parser",
@@ -498,5 +531,5 @@ void midi_init() {
         1
     );
 
-    ESP_LOGI(TAG, "Dual MIDI initialized: PORT 1 + PORT 2, VID=0xA006, PID=0x2E71");
+    ESP_LOGI(TAG, "Dual MIDI + CDC initialized: MIDI 1/2, Debug COM, VID=0xA006, PID=0x2E71");
 }

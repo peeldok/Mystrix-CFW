@@ -5,6 +5,7 @@ idf_component_register(
         "led.cpp"
         "matrix.cpp"
         "midi.cpp"
+        "cdc_debug.cpp"
         "cfy.cpp"
         "palette.cpp"
         "settings.cpp"

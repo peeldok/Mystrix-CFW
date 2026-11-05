@@ -18,5 +18,5 @@ extern "C" void app_main(void) {
     fsr_start();
     boot_animation_start();
 
-    ESP_LOGI("Mystrix", "Mystrix CFW v1.0.1: 3ms + batched MIDI + event-driven RMT DMA + ULP FSR + rotation");
+    ESP_LOGI("Mystrix", "Mystrix CFW v1.0.1: 3ms + batched MIDI + event-driven RMT DMA + USB CDC debug + ULP FSR + rotation");
 }
