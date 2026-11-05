@@ -22,7 +22,11 @@ static constexpr size_t LED_DATA_BYTES = NUM_LEDS * 3;
 
 static RGB framebuffer[NUM_LEDS]{};
 static RGB boot_framebuffer[NUM_LEDS]{};
-static uint8_t led_data[LED_DATA_BYTES]{};
+// RMT uses a DMA payload pointer until the transfer-complete callback.
+DRAM_ATTR static uint8_t led_data[2][LED_DATA_BYTES]{};
+static int8_t logical_to_physical_lut[NUM_LEDS]{};
+static RotationMode lut_rotation = RotationMode::Deg0;
+static bool lut_ready = false;
 static SemaphoreHandle_t framebuffer_mutex = nullptr;
 static std::atomic<bool> led_dirty{false};
 static std::atomic<bool> led_settings_ui_active{false};
@@ -35,10 +39,35 @@ static std::atomic<uint8_t> settings_side_brightness_state{255};
 static rmt_channel_handle_t rmt_channel = nullptr;
 static rmt_encoder_handle_t rmt_encoder = nullptr;
 static TaskHandle_t led_task_handle = nullptr;
-static esp_timer_handle_t led_periodic_timer = nullptr;
+static esp_timer_handle_t led_pacing_timer = nullptr;
+static std::atomic<bool> led_rmt_busy{false};
+static std::atomic<uint32_t> led_completed_frames{0};
 
 static void led_timer_callback(void *arg) {
     xTaskNotifyGive(static_cast<TaskHandle_t>(arg));
+}
+
+// Only wake the LED task from interrupt context. Never render pixels in ISR.
+static bool IRAM_ATTR led_on_rmt_done(
+    rmt_channel_handle_t channel,
+    const rmt_tx_done_event_data_t *edata,
+    void *user_data) {
+    (void)channel;
+    (void)edata;
+    (void)user_data;
+    led_rmt_busy.store(false, std::memory_order_release);
+    led_completed_frames.fetch_add(1, std::memory_order_relaxed);
+    BaseType_t wake = pdFALSE;
+    if (led_task_handle) {
+        vTaskNotifyGiveFromISR(led_task_handle, &wake);
+    }
+    return wake == pdTRUE;
+}
+
+static inline void notify_led_task() {
+    if (led_task_handle) {
+        xTaskNotifyGive(led_task_handle);
+    }
 }
 
 typedef struct {
@@ -166,46 +195,48 @@ static inline uint8_t scale8(uint8_t value, uint8_t brightness) {
     return static_cast<uint8_t>((static_cast<uint16_t>(value) * brightness + 127) / 255);
 }
 
-static bool prepare_latest_frame() {
+static bool prepare_latest_frame(uint8_t *frame_output) {
     if (xSemaphoreTake(framebuffer_mutex, 0) != pdTRUE) {
         return false;
     }
 
-    if (!led_dirty.load(std::memory_order_acquire)) {
+    // Consume dirty before rendering. Concurrent changes can mark dirty again,
+    // avoiding a lost update while the output frame is being prepared.
+    if (!led_dirty.exchange(false, std::memory_order_acq_rel)) {
         xSemaphoreGive(framebuffer_mutex);
         return false;
     }
 
     const uint8_t master_brightness = g_brightness;
     if (led_boot_active.load(std::memory_order_acquire)) {
-        for (size_t i = 0; i < LED_DATA_BYTES; ++i) led_data[i] = 0;
+        for (size_t i = 0; i < LED_DATA_BYTES; ++i) frame_output[i] = 0;
         for (int i = 0; i < NUM_LEDS; ++i) {
             const int physical_index = matrix_logical_led_to_physical(i);
             if (physical_index < 0 || physical_index >= NUM_LEDS) continue;
             const int offset = physical_index * 3;
-            led_data[offset + 0] = boot_framebuffer[i].g;
-            led_data[offset + 1] = boot_framebuffer[i].r;
-            led_data[offset + 2] = boot_framebuffer[i].b;
+            frame_output[offset + 0] = boot_framebuffer[i].g;
+            frame_output[offset + 1] = boot_framebuffer[i].r;
+            frame_output[offset + 2] = boot_framebuffer[i].b;
         }
     } else if (led_settings_ui_active.load(std::memory_order_acquire)) {
-        for (size_t i = 0; i < LED_DATA_BYTES; ++i) led_data[i] = 0;
+        for (size_t i = 0; i < LED_DATA_BYTES; ++i) frame_output[i] = 0;
 
         auto set_ui_pixel = [](int index, RGB color, uint8_t brightness) {
             if (index < 0 || index >= 64) return;
             const int physical_index = matrix_logical_led_to_physical(index);
             if (physical_index < 0 || physical_index >= 64) return;
             const int offset = physical_index * 3;
-            led_data[offset + 0] = scale8(color.g, brightness);
-            led_data[offset + 1] = scale8(color.r, brightness);
-            led_data[offset + 2] = scale8(color.b, brightness);
+            frame_output[offset + 0] = scale8(color.g, brightness);
+            frame_output[offset + 1] = scale8(color.r, brightness);
+            frame_output[offset + 2] = scale8(color.b, brightness);
         };
 
         auto set_ui_pixel_physical = [](int index, RGB color, uint8_t brightness) {
             if (index < 0 || index >= 64) return;
             const int offset = index * 3;
-            led_data[offset + 0] = scale8(color.g, brightness);
-            led_data[offset + 1] = scale8(color.r, brightness);
-            led_data[offset + 2] = scale8(color.b, brightness);
+            frame_output[offset + 0] = scale8(color.g, brightness);
+            frame_output[offset + 1] = scale8(color.r, brightness);
+            frame_output[offset + 2] = scale8(color.b, brightness);
         };
 
         const SettingsPage page = settings_page_state.load(std::memory_order_acquire);
@@ -269,26 +300,34 @@ static bool prepare_latest_frame() {
         const uint8_t matrix_brightness = settings_matrix_brightness_state.load(std::memory_order_acquire);
         const uint8_t side_brightness = settings_side_brightness_state.load(std::memory_order_acquire);
 
-        for (size_t i = 0; i < LED_DATA_BYTES; ++i) led_data[i] = 0;
+        const RotationMode rotation = settings_rotation();
+        if (!lut_ready || rotation != lut_rotation) {
+            for (int i = 0; i < NUM_LEDS; ++i) {
+                logical_to_physical_lut[i] = static_cast<int8_t>(
+                    matrix_logical_led_to_physical(i));
+            }
+            lut_rotation = rotation;
+            lut_ready = true;
+        }
+        const uint8_t matrix_effective = scale8(master_brightness, matrix_brightness);
+        const uint8_t side_effective = scale8(master_brightness, side_brightness);
+        for (size_t i = 0; i < LED_DATA_BYTES; ++i) frame_output[i] = 0;
         for (int i = 0; i < NUM_LEDS; ++i) {
-            const int physical_index = matrix_logical_led_to_physical(i);
+            const int physical_index = logical_to_physical_lut[i];
             if (physical_index < 0 || physical_index >= NUM_LEDS) continue;
             const int offset = physical_index * 3;
-            const uint8_t region_brightness = i < 64 ? matrix_brightness : side_brightness;
-            const uint8_t effective_brightness = scale8(master_brightness, region_brightness);
-            led_data[offset + 0] = scale8(framebuffer[i].g, effective_brightness);
-            led_data[offset + 1] = scale8(framebuffer[i].r, effective_brightness);
-            led_data[offset + 2] = scale8(framebuffer[i].b, effective_brightness);
+            const uint8_t effective = i < 64 ? matrix_effective : side_effective;
+            frame_output[offset + 0] = scale8(framebuffer[i].g, effective);
+            frame_output[offset + 1] = scale8(framebuffer[i].r, effective);
+            frame_output[offset + 2] = scale8(framebuffer[i].b, effective);
         }
     }
 
-    led_dirty.store(false, std::memory_order_release);
     xSemaphoreGive(framebuffer_mutex);
     return true;
 }
 
 static void led_task(void *) {
-
     const rmt_transmit_config_t tx_cfg = {
         .loop_count = 0,
         .flags = {
@@ -296,36 +335,75 @@ static void led_task(void *) {
             .queue_nonblocking = 1,
         },
     };
+    int next_dma_frame = 0;
+    int64_t last_start_us = 0;
+    int64_t stats_start_us = esp_timer_get_time();
+    uint32_t last_completed = 0;
+    uint32_t prepare_count = 0;
+    uint64_t prepare_total_us = 0;
+    uint32_t tx_errors = 0;
 
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Notifications can come from MIDI updates, timer pacing, and RMT done.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
 
-        if (!led_dirty.load(std::memory_order_acquire)) {
+        int64_t now = esp_timer_get_time();
+        if (now - stats_start_us >= 1000000) {
+            const uint32_t done = led_completed_frames.load(std::memory_order_relaxed);
+            const uint32_t completed = done - last_completed;
+            const int64_t elapsed = now - stats_start_us;
+            ESP_LOGI(TAG, "PERF LED done_fps=%lu prepared=%lu avg_prepare_us=%lu tx_err=%lu",
+                static_cast<unsigned long>((static_cast<uint64_t>(completed) * 1000000ULL) / elapsed),
+                static_cast<unsigned long>(prepare_count),
+                static_cast<unsigned long>(prepare_count ? prepare_total_us / prepare_count : 0),
+                static_cast<unsigned long>(tx_errors));
+            last_completed = done;
+            prepare_count = 0;
+            prepare_total_us = 0;
+            tx_errors = 0;
+            stats_start_us = now;
+        }
+
+        if (led_rmt_busy.load(std::memory_order_acquire) ||
+            !led_dirty.load(std::memory_order_acquire)) {
             continue;
         }
 
-
-        if (rmt_tx_wait_all_done(rmt_channel, 0) != ESP_OK) {
+        now = esp_timer_get_time();
+        const int64_t until = last_start_us + LED_FRAME_INTERVAL_US - now;
+        if (last_start_us != 0 && until > 0) {
+            if (led_pacing_timer && !esp_timer_is_active(led_pacing_timer)) {
+                ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(led_pacing_timer, until));
+            }
             continue;
         }
 
-        if (!prepare_latest_frame()) {
+        const int64_t prepare_start = esp_timer_get_time();
+        if (!prepare_latest_frame(led_data[next_dma_frame])) {
             continue;
         }
+        ++prepare_count;
+        prepare_total_us += esp_timer_get_time() - prepare_start;
 
+        led_rmt_busy.store(true, std::memory_order_release);
         const esp_err_t err = rmt_transmit(
             rmt_channel,
             rmt_encoder,
-            led_data,
-            sizeof(led_data),
+            led_data[next_dma_frame],
+            sizeof(led_data[next_dma_frame]),
             &tx_cfg
         );
-
-        if (err != ESP_OK) {
-
-            xSemaphoreTake(framebuffer_mutex, portMAX_DELAY);
+        if (err == ESP_OK) {
+            last_start_us = esp_timer_get_time();
+            next_dma_frame ^= 1;
+        } else {
+            led_rmt_busy.store(false, std::memory_order_release);
             led_dirty.store(true, std::memory_order_release);
-            xSemaphoreGive(framebuffer_mutex);
+            ++tx_errors;
+            // Back off on RMT queue error instead of spinning.
+            if (led_pacing_timer && !esp_timer_is_active(led_pacing_timer)) {
+                ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(led_pacing_timer, 1000));
+            }
         }
     }
 }
@@ -338,7 +416,7 @@ void led_init() {
     channel_cfg.gpio_num = static_cast<gpio_num_t>(LED_GPIO);
     channel_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
     channel_cfg.resolution_hz = RMT_RESOLUTION_HZ;
-    channel_cfg.mem_block_symbols = 256;
+    channel_cfg.mem_block_symbols = 1024;
     channel_cfg.trans_queue_depth = 1;
     channel_cfg.intr_priority = 0;
     channel_cfg.flags.invert_out = 0;
@@ -355,6 +433,14 @@ void led_init() {
     err = create_led_encoder(&rmt_encoder);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "create_led_encoder failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    rmt_tx_event_callbacks_t callbacks = {};
+    callbacks.on_trans_done = led_on_rmt_done;
+    err = rmt_tx_register_event_callbacks(rmt_channel, &callbacks, nullptr);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "rmt_tx_register_event_callbacks failed: %s", esp_err_to_name(err));
         return;
     }
 
@@ -382,19 +468,14 @@ void led_init() {
     timer_args.callback = led_timer_callback;
     timer_args.arg = led_task_handle;
     timer_args.dispatch_method = ESP_TIMER_TASK;
-    timer_args.name = "led_300fps";
+    timer_args.name = "led_pace_3ms";
 
-    err = esp_timer_create(&timer_args, &led_periodic_timer);
+    err = esp_timer_create(&timer_args, &led_pacing_timer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_timer_create failed: %s", esp_err_to_name(err));
         return;
     }
-    err = esp_timer_start_periodic(led_periodic_timer, LED_FRAME_INTERVAL_US);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_timer_start_periodic failed: %s", esp_err_to_name(err));
-        return;
-    }
-
+    // The pacing timer is one-shot; RMT completion triggers the next refresh.
     led_fill({0, 0, 0});
     led_mark_dirty();
     ESP_LOGI(TAG, "RMT DMA LED driver started at target %u FPS (%lu us period)",
@@ -407,6 +488,7 @@ void led_set_pixel(int index, RGB color) {
     framebuffer[index] = color;
     led_dirty.store(true, std::memory_order_release);
     xSemaphoreGive(framebuffer_mutex);
+    notify_led_task();
 }
 
 void led_fill(RGB color) {
@@ -414,6 +496,7 @@ void led_fill(RGB color) {
     for (auto &pixel : framebuffer) pixel = color;
     led_dirty.store(true, std::memory_order_release);
     xSemaphoreGive(framebuffer_mutex);
+    notify_led_task();
 }
 
 void led_set_brightness(uint8_t brightness) {
@@ -421,10 +504,12 @@ void led_set_brightness(uint8_t brightness) {
     g_brightness = brightness;
     led_dirty.store(true, std::memory_order_release);
     xSemaphoreGive(framebuffer_mutex);
+    notify_led_task();
 }
 
 void led_mark_dirty() {
     led_dirty.store(true, std::memory_order_release);
+    notify_led_task();
 }
 
 void led_begin_update() {
@@ -443,6 +528,7 @@ void led_fill_unlocked(RGB color) {
 void led_end_update(bool notify) {
     if (notify) led_dirty.store(true, std::memory_order_release);
     xSemaphoreGive(framebuffer_mutex);
+    if (notify) notify_led_task();
 }
 
 void led_set_settings_ui(
@@ -460,6 +546,7 @@ void led_set_settings_ui(
     settings_matrix_brightness_state.store(matrix_brightness, std::memory_order_release);
     settings_side_brightness_state.store(side_brightness, std::memory_order_release);
     led_dirty.store(true, std::memory_order_release);
+    notify_led_task();
 }
 
 void led_boot_begin() {
@@ -468,6 +555,7 @@ void led_boot_begin() {
     led_boot_active.store(true, std::memory_order_release);
     led_dirty.store(true, std::memory_order_release);
     xSemaphoreGive(framebuffer_mutex);
+    notify_led_task();
 }
 
 void led_boot_end() {
@@ -475,6 +563,7 @@ void led_boot_end() {
     led_boot_active.store(false, std::memory_order_release);
     led_dirty.store(true, std::memory_order_release);
     xSemaphoreGive(framebuffer_mutex);
+    notify_led_task();
 }
 
 void led_boot_set_pixel(int index, RGB color) {
@@ -492,4 +581,5 @@ void led_boot_fill(RGB color) {
 
 void led_boot_mark_dirty() {
     led_dirty.store(true, std::memory_order_release);
+    notify_led_task();
 }
