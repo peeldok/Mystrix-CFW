@@ -1,8 +1,8 @@
-name: Mystrix CFW Dual-Core USB RX Optimization
+name: Mystrix CFW Vendor Bulk MIDI Bridge
 on:
   push:
     branches:
-      - perf/dualcore-usb-rx-20261105
+      - feat/vendor-bulk-midi-20261105
   workflow_dispatch:
 jobs:
   uf2:
@@ -20,10 +20,10 @@ jobs:
           . /opt/esp/idf/export.sh
           idf.py set-target esp32s3
           idf.py build
-          python3 tools/generate_mystrix_uf2.py build/Mystrix_CFW.bin build/Mystrix-CFW-1.0.1-DUALCORE-USB4096.uf2
+          python3 tools/generate_mystrix_uf2.py build/Mystrix_CFW.bin build/Mystrix-CFW-1.0.1-VENDOR-BULK.uf2
       - name: Upload DFU UF2
         uses: actions/upload-artifact@v4
         with:
-          name: Mystrix-CFW-1.0.1-DUALCORE-USB4096-DFU
-          path: build/Mystrix-CFW-1.0.1-DUALCORE-USB4096.uf2
+          name: Mystrix-CFW-1.0.1-VENDOR-BULK-DFU
+          path: build/Mystrix-CFW-1.0.1-VENDOR-BULK.uf2
           if-no-files-found: error

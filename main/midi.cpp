@@ -34,6 +34,12 @@ static constexpr uint8_t MIDI2_EP_IN  = 0x82;
 static constexpr uint8_t CDC_EP_NOTIF = 0x83;
 static constexpr uint8_t CDC_EP_OUT = 0x04;
 static constexpr uint8_t CDC_EP_IN = 0x84;
+// USB Full-Speed S3 has no spare IN endpoint after MIDI1, MIDI2 and CDC.
+// An OUT-only vendor-specific Bulk interface is sufficient for fast LED MIDI.
+static constexpr uint8_t BULK_EP_OUT = 0x05;
+static constexpr uint8_t BULK_INTERFACE_NUM = 6;
+static constexpr uint16_t BULK_DESCRIPTOR_LEN = 9 + 7;
+
 
 enum {
     ITF_NUM_MIDI1 = 0,
@@ -42,6 +48,7 @@ enum {
     ITF_NUM_MIDI2_STREAMING,
     ITF_NUM_CDC_CONTROL,
     ITF_NUM_CDC_DATA,
+    ITF_NUM_VENDOR_BULK,
     ITF_NUM_TOTAL
 };
 
@@ -49,7 +56,8 @@ static constexpr uint16_t USB_CONFIG_TOTAL_LEN =
     TUD_CONFIG_DESC_LEN +
     TUD_MIDI_DESC_LEN +
     TUD_MIDI_DESC_LEN +
-    TUD_CDC_DESC_LEN;
+    TUD_CDC_DESC_LEN +
+    BULK_DESCRIPTOR_LEN;
 
 static const tusb_desc_device_t usb_device_descriptor = {
     .bLength            = sizeof(tusb_desc_device_t),
@@ -61,7 +69,7 @@ static const tusb_desc_device_t usb_device_descriptor = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0102,
+    .bcdDevice          = 0x0103,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,
@@ -103,6 +111,13 @@ static const uint8_t usb_configuration_descriptor[] = {
         CDC_EP_IN,
         64
     ),
+
+    // Vendor-specific interface #6, BULK OUT EP5. NO bulk IN endpoint:
+    // preserves four existing IN endpoints needed by the dual MIDI + CDC.
+    // USB-MIDI Event Packets (4 bytes each) are sent as a continuous stream.
+    9, TUSB_DESC_INTERFACE, ITF_NUM_VENDOR_BULK, 0, 1,
+       TUSB_CLASS_VENDOR_SPECIFIC, 0, 0, 7,
+    7, TUSB_DESC_ENDPOINT, BULK_EP_OUT, TUSB_XFER_BULK, 64, 0, 0,
 };
 
 static const char usb_langid[] = {0x09, 0x04};
@@ -114,6 +129,7 @@ static const char *usb_string_descriptors[] = {
     "Mystrix (CFW)",
     "Mystrix (CFW)",
     "Mystrix Debug CDC",
+    "Mystrix Bulk MIDI",
 };
 
 struct UsbMidiPacket {
@@ -135,6 +151,20 @@ static std::atomic<uint32_t> usb_cb_max_packets{0};
 static std::atomic<uint32_t> usb_cb_max_us{0};
 static std::atomic<uint32_t> usb_cb_total_us{0};
 static std::atomic<uint32_t> usb_cb_empty{0};
+
+// OUT-only Vendor Bulk transport telemetry. Unlike the legacy USB-MIDI IN/OUT
+// endpoints, this path is intended to deliver >= 16 MIDI events in one 64B
+// USB transaction. No MIDI events are merged, filtered or reordered.
+static std::atomic<uint32_t> bulk_received_packets{0};
+static std::atomic<uint32_t> bulk_received_bytes{0};
+static std::atomic<uint32_t> bulk_queue_drops{0};
+static std::atomic<uint32_t> bulk_callbacks{0};
+static std::atomic<uint32_t> bulk_callback_peak_us{0};
+static std::atomic<uint32_t> bulk_callback_total_us{0};
+static std::atomic<uint32_t> bulk_callback_peak_packets{0};
+static uint8_t bulk_fragment[4]{};
+static uint8_t bulk_fragment_size = 0;
+
 
 
 // The recorder provided a 4s capture with precisely 8377 NoteOn + 8377 NoteOff.
@@ -276,6 +306,93 @@ extern "C" void tud_midi_rx_cb(uint8_t itf) {
     const uint32_t elapsed = static_cast<uint32_t>(esp_timer_get_time()) - start_us;
     usb_cb_total_us.fetch_add(elapsed, std::memory_order_relaxed);
     atomic_update_max(usb_cb_max_us, elapsed);
+}
+
+
+/*
+ * Vendor Bulk protocol v1:
+ *  - one continuous stream of standard 4-byte USB-MIDI 1.0 Event Packets;
+ *  - event[0] = CIN (and upper cable nibble, currently 0);
+ *  - event[1..3] are normal MIDI bytes, zero padded where needed.
+ *
+ * Bulk transfers may be split across endpoint transactions. The 0..3-byte
+ * reassembly buffer guarantees correct 4-byte alignment across callbacks.
+ * Existing MIDI port #0 semantics and the same parser are reused.
+ *
+ * Only the TinyUSB service task (CPU1) calls this callback. USB OUT is not
+ * slowed by per-event logging or any LED/RMT operations.
+ */
+extern "C" void tud_vendor_rx_cb(uint8_t itf, const uint8_t *buffer, uint16_t length) {
+    (void)buffer; (void)length;
+    if (itf != 0 || midi_rx_queue == nullptr) return;
+
+    const uint32_t started_us = static_cast<uint32_t>(esp_timer_get_time());
+    uint32_t complete = 0, accepted = 0, dropped = 0;
+    uint32_t note_on = 0, note_off = 0, other = 0;
+    uint32_t total_bytes = 0;
+    uint8_t scratch[256];
+
+    // Drain the TinyUSB vendor RX FIFO (8192 bytes) in larger bursts, avoiding
+    // the classic one-MIDI-message-per-USB-callback transfer inefficiency.
+    while (tud_vendor_n_available(itf) != 0) {
+        const uint32_t got = tud_vendor_n_read(itf, scratch, sizeof(scratch));
+        if (got == 0) break;
+        total_bytes += got;
+
+        for (uint32_t i = 0; i < got; ++i) {
+            bulk_fragment[bulk_fragment_size++] = scratch[i];
+            if (bulk_fragment_size != 4) continue;
+            bulk_fragment_size = 0;
+            ++complete;
+
+            const uint8_t cin = bulk_fragment[0] & 0x0F;
+            const uint8_t group = bulk_fragment[1] & 0xF0;
+            if ((cin == 0x08 || cin == 0x09) &&
+                (group == 0x80 || group == 0x90)) {
+                if (group == 0x90 && bulk_fragment[3] != 0) ++note_on;
+                else ++note_off;
+            } else {
+                ++other;
+            }
+
+            UsbMidiPacket pkt{};
+            pkt.port = 0; // MIDI1 semantics: existing palette and SysEx logic.
+            pkt.arrival_us = started_us;
+            std::memcpy(pkt.data, bulk_fragment, sizeof(pkt.data));
+
+            // With the default 2048-event parser queue this should rarely
+            // happen. Do NOT delete an earlier Note Off to make room:
+            // a dropped older event can create a stuck/incorrect LED state.
+            if (xQueueSend(midi_rx_queue, &pkt, 0) == pdTRUE) {
+                ++accepted;
+            } else {
+                ++dropped;
+            }
+        }
+    }
+
+    if (accepted) {
+        received_rx_packets.fetch_add(accepted, std::memory_order_relaxed);
+        bulk_received_packets.fetch_add(accepted, std::memory_order_relaxed);
+        atomic_update_max(rx_queue_peak, static_cast<uint32_t>(
+            uxQueueMessagesWaiting(midi_rx_queue)));
+    }
+    if (dropped) {
+        dropped_rx_packets.fetch_add(dropped, std::memory_order_relaxed);
+        bulk_queue_drops.fetch_add(dropped, std::memory_order_relaxed);
+    }
+    if (note_on || note_off) {
+        last_note_arrival_us.store(started_us, std::memory_order_release);
+        raw_note_on.fetch_add(note_on, std::memory_order_relaxed);
+        raw_note_off.fetch_add(note_off, std::memory_order_relaxed);
+    }
+    if (other) raw_other_packets.fetch_add(other, std::memory_order_relaxed);
+    bulk_received_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
+    bulk_callbacks.fetch_add(1, std::memory_order_relaxed);
+    atomic_update_max(bulk_callback_peak_packets, complete);
+    const uint32_t elapsed = static_cast<uint32_t>(esp_timer_get_time()) - started_us;
+    bulk_callback_total_us.fetch_add(elapsed, std::memory_order_relaxed);
+    atomic_update_max(bulk_callback_peak_us, elapsed);
 }
 
 static void midi_send_3_to_port(uint8_t port, uint8_t status, uint8_t d1, uint8_t d2) {
@@ -598,6 +715,24 @@ static void midi_stats_task(void *) {
             MIDI_RX_FIFO_BYTES, MIDI_RX_QUEUE_SIZE,
             CPU_USB, PRIO_USB, PRIO_MIDI_PARSER);
 
+        const uint32_t bulk_count = bulk_received_packets.exchange(0, std::memory_order_relaxed);
+        const uint32_t bulk_bytes = bulk_received_bytes.exchange(0, std::memory_order_relaxed);
+        const uint32_t bulk_cbs = bulk_callbacks.exchange(0, std::memory_order_relaxed);
+        const uint32_t bulk_max_packets = bulk_callback_peak_packets.exchange(0, std::memory_order_relaxed);
+        const uint32_t bulk_max_us = bulk_callback_peak_us.exchange(0, std::memory_order_relaxed);
+        const uint32_t bulk_sum_us = bulk_callback_total_us.exchange(0, std::memory_order_relaxed);
+        const uint32_t bulk_drops = bulk_queue_drops.exchange(0, std::memory_order_relaxed);
+        ESP_LOGI("bulk",
+            "RX=%lu/s bytes=%lu/s callbacks=%lu/s packets_per_cb_max=%lu cb_max_us=%lu cb_avg_us=%lu drops=%lu ep_out=0x%02X itf=%u",
+            static_cast<unsigned long>(bulk_count),
+            static_cast<unsigned long>(bulk_bytes),
+            static_cast<unsigned long>(bulk_cbs),
+            static_cast<unsigned long>(bulk_max_packets),
+            static_cast<unsigned long>(bulk_max_us),
+            static_cast<unsigned long>(bulk_cbs ? bulk_sum_us / bulk_cbs : 0),
+            static_cast<unsigned long>(bulk_drops),
+            BULK_EP_OUT, BULK_INTERFACE_NUM);
+
         perf_diag_log_snapshot();
         led_perf_log_snapshot();
 
@@ -738,7 +873,7 @@ void midi_init() {
         midi_stats_task, "midi_stats", 4096, nullptr, PRIO_STATS, nullptr, CPU_STATS
     );
     configASSERT(stats_created == pdPASS);
-    ESP_LOGI(TAG, "Dual MIDI+CDC: USB core%d/prio%d, parser core%d/prio%d, LED core%d/prio%d, FSR core%d/prio%d; FIFO RX=%u TX=%u, queue=%u",
+    ESP_LOGI(TAG, "Dual MIDI+CDC+VENDOR BULK OUT: USB core%d/prio%d, parser core%d/prio%d, LED core%d/prio%d, FSR core%d/prio%d; FIFO RX=%u TX=%u, queue=%u",
         CPU_USB, PRIO_USB, CPU_MIDI_PARSER, PRIO_MIDI_PARSER,
         CPU_LED, PRIO_LED, CPU_FSR, PRIO_FSR,
         MIDI_RX_FIFO_BYTES, MIDI_TX_FIFO_BYTES, MIDI_RX_QUEUE_SIZE);
