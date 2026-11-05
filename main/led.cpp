@@ -433,7 +433,7 @@ void led_init() {
     channel_cfg.gpio_num = static_cast<gpio_num_t>(LED_GPIO);
     channel_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
     channel_cfg.resolution_hz = RMT_RESOLUTION_HZ;
-    channel_cfg.mem_block_symbols = 1024;
+    channel_cfg.mem_block_symbols = 2040;  // Maximum-safe 2-node GDMA test, was 1024
     channel_cfg.trans_queue_depth = 1;
     channel_cfg.intr_priority = 0;
     channel_cfg.flags.invert_out = 0;
@@ -495,7 +495,7 @@ void led_init() {
     // The pacing timer is one-shot; RMT completion triggers the next refresh.
     led_fill({0, 0, 0});
     led_mark_dirty();
-    ESP_LOGI(TAG, "RMT DMA LED driver started at target %u FPS (%lu us period)",
+    ESP_LOGI(TAG, "RMT DMA (2040 symbols) started at target %u FPS (%lu us period)",
              LED_TARGET_FPS, static_cast<unsigned long>(LED_FRAME_INTERVAL_US));
 }
 
