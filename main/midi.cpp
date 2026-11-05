@@ -1,5 +1,8 @@
 #include "midi.h"
 
+#include <atomic>
+#include <cstring>
+
 #include "cfy.h"
 #include "config.h"
 #include "fsr.h"
@@ -9,6 +12,7 @@
 #include "types.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -99,8 +103,30 @@ struct UsbMidiPacket {
 
 static QueueHandle_t midi_rx_queue = nullptr;
 static QueueHandle_t button_queue = nullptr;
-static uint32_t dropped_rx_packets = 0;
+static std::atomic<uint32_t> dropped_rx_packets{0};
+static std::atomic<uint32_t> received_rx_packets{0};
+static std::atomic<uint32_t> rx_queue_peak{0};
 static uint32_t dropped_tx_events = 0;
+static constexpr uint32_t MIDI_PARSE_BATCH_LIMIT = 192;
+static constexpr int64_t MIDI_PARSE_BUDGET_US = 750;
+
+// Only display the most recent state of a pad within one MIDI parse batch.
+// Note and SysEx ordering is preserved by flushing pending notes before SysEx.
+static RGB staged_note_colors[NUM_LEDS]{};
+static uint8_t staged_note_mask[NUM_LEDS]{};
+static bool staged_note_dirty = false;
+
+static void flush_note_batch() {
+    if (!staged_note_dirty) return;
+    led_begin_update();
+    for (int i = 0; i < NUM_LEDS; ++i) {
+        if (!staged_note_mask[i]) continue;
+        led_set_pixel_unlocked(i, staged_note_colors[i]);
+        staged_note_mask[i] = 0;
+    }
+    led_end_update(true);
+    staged_note_dirty = false;
+}
 
 static constexpr size_t SYSEX_BUFFER_SIZE = 1024;
 
@@ -118,9 +144,15 @@ static void enqueue_rx_drop_oldest(const UsbMidiPacket &packet) {
     if (uxQueueSpacesAvailable(midi_rx_queue) == 0) {
         UsbMidiPacket discarded{};
         xQueueReceive(midi_rx_queue, &discarded, 0);
-        ++dropped_rx_packets;
+        dropped_rx_packets.fetch_add(1, std::memory_order_relaxed);
     }
-    xQueueSend(midi_rx_queue, &packet, 0);
+    if (xQueueSend(midi_rx_queue, &packet, 0) == pdTRUE) {
+        received_rx_packets.fetch_add(1, std::memory_order_relaxed);
+        uint32_t size = static_cast<uint32_t>(uxQueueMessagesWaiting(midi_rx_queue));
+        uint32_t peak = rx_queue_peak.load(std::memory_order_relaxed);
+        while (size > peak && !rx_queue_peak.compare_exchange_weak(
+            peak, size, std::memory_order_relaxed)) {}
+    }
 }
 
 extern "C" void tud_midi_rx_cb(uint8_t itf) {
@@ -170,11 +202,11 @@ static void handle_note(uint8_t status, uint8_t note, uint8_t velocity) {
     const int idx = drum_pitch_to_led(note);
     if (idx < 0 || idx >= NUM_LEDS) return;
 
-    if (is_note_off) {
-        led_set_pixel(idx, {0, 0, 0});
-    } else {
-        led_set_pixel(idx, palette_color(channel, velocity));
-    }
+    staged_note_colors[idx] = is_note_off
+        ? RGB{0, 0, 0}
+        : palette_color(channel, velocity);
+    staged_note_mask[idx] = 1;
+    staged_note_dirty = true;
 }
 
 static void send_identity_reply(uint8_t port) {
@@ -359,6 +391,7 @@ static void process_usb_packet(uint8_t port, const uint8_t packet[4]) {
         cin == 0x5 ||
         cin == 0x6 ||
         cin == 0x7) {
+        flush_note_batch(); // An entire SysEx must remain ordered after preceding Notes.
         for (uint8_t i = 0; i < len; ++i) {
             sysex_push(port, packet[1 + i]);
         }
@@ -373,9 +406,41 @@ static void process_usb_packet(uint8_t port, const uint8_t packet[4]) {
 
 static void midi_parser_task(void *) {
     UsbMidiPacket packet{};
+    uint32_t parsed_in_window = 0;
+    int64_t stats_start_us = esp_timer_get_time();
+    uint32_t last_drop_count = 0;
+
     for (;;) {
-        if (xQueueReceive(midi_rx_queue, &packet, portMAX_DELAY) == pdTRUE) {
-            process_usb_packet(packet.port, packet.data);
+        if (xQueueReceive(midi_rx_queue, &packet, pdMS_TO_TICKS(25)) == pdTRUE) {
+            const int64_t batch_start_us = esp_timer_get_time();
+            uint32_t processed = 0;
+            do {
+                process_usb_packet(packet.port, packet.data);
+                ++processed;
+                // Limit processing time to avoid monopolizing core 1.
+                if (processed >= MIDI_PARSE_BATCH_LIMIT ||
+                    esp_timer_get_time() - batch_start_us >= MIDI_PARSE_BUDGET_US) {
+                    break;
+                }
+            } while (xQueueReceive(midi_rx_queue, &packet, 0) == pdTRUE);
+            flush_note_batch();
+            parsed_in_window += processed;
+        }
+
+        const int64_t now_us = esp_timer_get_time();
+        const int64_t elapsed_us = now_us - stats_start_us;
+        if (elapsed_us >= 1000000) {
+            const uint32_t receive_count = received_rx_packets.exchange(0, std::memory_order_relaxed);
+            const uint32_t drop_count = dropped_rx_packets.load(std::memory_order_relaxed);
+            const uint32_t peak = rx_queue_peak.exchange(0, std::memory_order_relaxed);
+            ESP_LOGI(TAG, "PERF MIDI RX=%lu/s parsed=%lu/s peak=%lu/%u drops=%lu",
+                static_cast<unsigned long>((static_cast<uint64_t>(receive_count) * 1000000ULL) / elapsed_us),
+                static_cast<unsigned long>((static_cast<uint64_t>(parsed_in_window) * 1000000ULL) / elapsed_us),
+                static_cast<unsigned long>(peak), MIDI_RX_QUEUE_SIZE,
+                static_cast<unsigned long>(drop_count - last_drop_count));
+            last_drop_count = drop_count;
+            parsed_in_window = 0;
+            stats_start_us = now_us;
         }
     }
 }

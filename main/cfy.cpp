@@ -5,14 +5,28 @@
 #include "matrix.h"
 #include "types.h"
 
+// Lookup replaces an O(10x10) scan for every CFY address.
+static int8_t cfy_address_lut[128];
+static bool cfy_lut_ready = false;
+
+static void init_cfy_lut() {
+    if (cfy_lut_ready) return;
+    for (int i = 0; i < 128; ++i) {
+        cfy_address_lut[i] = static_cast<int8_t>(nonlit_address_to_led(i));
+    }
+    cfy_lut_ready = true;
+}
+
 static inline void set_address_unlocked(uint8_t address, RGB color) {
-    const int idx = nonlit_address_to_led(address);
+    if (address >= 128) return;
+    const int idx = cfy_address_lut[address];
     if (idx >= 0) led_set_pixel_unlocked(idx, color);
 }
 
 void cfy_handle(const uint8_t *data, size_t length) {
     size_t pos = 0;
 
+    init_cfy_lut();
     led_begin_update();
 
     while (pos + 3 <= length) {
