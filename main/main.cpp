@@ -18,5 +18,5 @@ extern "C" void app_main(void) {
     fsr_start();
     boot_animation_start();
 
-    ESP_LOGI("Mystrix", "Mystrix CFW v1.0.1: 300 FPS + MIDI 2x queues/FIFOs + ULP FSR + rotation");
+    ESP_LOGI("Mystrix", "Mystrix CFW v1.0.1: 3ms (333 FPS) + MIDI 4x queues/FIFOs + ULP FSR + rotation");
 }
