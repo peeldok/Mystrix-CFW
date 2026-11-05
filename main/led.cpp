@@ -221,7 +221,7 @@ static bool prepare_latest_frame(uint8_t *frame_output) {
     } else if (led_settings_ui_active.load(std::memory_order_acquire)) {
         for (size_t i = 0; i < LED_DATA_BYTES; ++i) frame_output[i] = 0;
 
-        auto set_ui_pixel = [](int index, RGB color, uint8_t brightness) {
+        auto set_ui_pixel = [frame_output](int index, RGB color, uint8_t brightness) {
             if (index < 0 || index >= 64) return;
             const int physical_index = matrix_logical_led_to_physical(index);
             if (physical_index < 0 || physical_index >= 64) return;
@@ -231,7 +231,7 @@ static bool prepare_latest_frame(uint8_t *frame_output) {
             frame_output[offset + 2] = scale8(color.b, brightness);
         };
 
-        auto set_ui_pixel_physical = [](int index, RGB color, uint8_t brightness) {
+        auto set_ui_pixel_physical = [frame_output](int index, RGB color, uint8_t brightness) {
             if (index < 0 || index >= 64) return;
             const int offset = index * 3;
             frame_output[offset + 0] = scale8(color.g, brightness);
