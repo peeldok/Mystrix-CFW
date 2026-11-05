@@ -31,3 +31,6 @@ void led_boot_fill(RGB color);
 void led_boot_mark_dirty();
 
 uint32_t led_completed_frame_count();
+
+// Call only between led_begin_update() and led_end_update().
+void led_record_midi_arrival_unlocked(uint32_t arrival_us);

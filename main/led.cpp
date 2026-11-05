@@ -2,6 +2,7 @@
 #include "config.h"
 #include "matrix.h"
 #include "palette.h"
+#include "perf_diag.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -46,6 +47,11 @@ static std::atomic<uint32_t> rmt_start_us{0};
 static std::atomic<uint32_t> rmt_duration_sum_us{0};
 static std::atomic<uint32_t> rmt_duration_max_us{0};
 static std::atomic<uint32_t> rmt_duration_samples{0};
+static std::atomic<uint32_t> rmt_last_done_us{0};
+static std::atomic<uint32_t> rmt_midi_arrival_inflight_us{0};
+// Protected by framebuffer_mutex, used to tag the oldest MIDI change
+// that is still pending in the next RMT frame.
+static uint32_t pending_midi_first_arrival_us = 0;
 
 static void led_timer_callback(void *arg) {
     xTaskNotifyGive(static_cast<TaskHandle_t>(arg));
@@ -66,6 +72,12 @@ static bool IRAM_ATTR led_on_rmt_done(
     uint32_t peak = rmt_duration_max_us.load(std::memory_order_relaxed);
     while (elapsed_us > peak && !rmt_duration_max_us.compare_exchange_weak(
         peak, elapsed_us, std::memory_order_relaxed)) {}
+    const uint32_t arrival_us =
+        rmt_midi_arrival_inflight_us.load(std::memory_order_relaxed);
+    if (arrival_us != 0) {
+        perf_diag_led_frame_done(arrival_us, finished_us);
+    }
+    rmt_last_done_us.store(finished_us, std::memory_order_relaxed);
     led_rmt_busy.store(false, std::memory_order_release);
     led_completed_frames.fetch_add(1, std::memory_order_relaxed);
     BaseType_t wake = pdFALSE;
@@ -206,7 +218,7 @@ static inline uint8_t scale8(uint8_t value, uint8_t brightness) {
     return static_cast<uint8_t>((static_cast<uint16_t>(value) * brightness + 127) / 255);
 }
 
-static bool prepare_latest_frame(uint8_t *frame_output) {
+static bool prepare_latest_frame(uint8_t *frame_output, uint32_t *midi_first_arrival_us) {
     if (xSemaphoreTake(framebuffer_mutex, 0) != pdTRUE) {
         return false;
     }
@@ -217,6 +229,9 @@ static bool prepare_latest_frame(uint8_t *frame_output) {
         xSemaphoreGive(framebuffer_mutex);
         return false;
     }
+
+    *midi_first_arrival_us = pending_midi_first_arrival_us;
+    pending_midi_first_arrival_us = 0;
 
     const uint8_t master_brightness = g_brightness;
     if (led_boot_active.load(std::memory_order_acquire)) {
@@ -395,13 +410,21 @@ static void led_task(void *) {
         }
 
         const int64_t prepare_start = esp_timer_get_time();
-        if (!prepare_latest_frame(led_data[next_dma_frame])) {
+        uint32_t midi_first_arrival_us = 0;
+        if (!prepare_latest_frame(led_data[next_dma_frame], &midi_first_arrival_us)) {
             continue;
         }
         ++prepare_count;
         prepare_total_us += esp_timer_get_time() - prepare_start;
 
-        rmt_start_us.store(static_cast<uint32_t>(esp_timer_get_time()), std::memory_order_relaxed);
+        const uint32_t submit_us = static_cast<uint32_t>(esp_timer_get_time());
+        const uint32_t prev_done_us = rmt_last_done_us.load(std::memory_order_relaxed);
+        if (prev_done_us != 0) {
+            const uint32_t gap_us = submit_us - prev_done_us;
+            if (gap_us < 10000) perf_diag_rmt_interframe_gap(gap_us);
+        }
+        rmt_start_us.store(submit_us, std::memory_order_relaxed);
+        rmt_midi_arrival_inflight_us.store(midi_first_arrival_us, std::memory_order_relaxed);
         led_rmt_busy.store(true, std::memory_order_release);
         const esp_err_t err = rmt_transmit(
             rmt_channel,
@@ -411,10 +434,20 @@ static void led_task(void *) {
             &tx_cfg
         );
         if (err == ESP_OK) {
+            if (midi_first_arrival_us != 0) {
+                perf_diag_led_frame_submitted(midi_first_arrival_us, submit_us);
+            }
             last_start_us = esp_timer_get_time();
             next_dma_frame ^= 1;
         } else {
             led_rmt_busy.store(false, std::memory_order_release);
+            rmt_midi_arrival_inflight_us.store(0, std::memory_order_relaxed);
+            if (midi_first_arrival_us != 0 && framebuffer_mutex) {
+                xSemaphoreTake(framebuffer_mutex, portMAX_DELAY);
+                if (!pending_midi_first_arrival_us)
+                    pending_midi_first_arrival_us = midi_first_arrival_us;
+                xSemaphoreGive(framebuffer_mutex);
+            }
             led_dirty.store(true, std::memory_order_release);
             ++tx_errors;
             // Back off on RMT queue error instead of spinning.
@@ -603,4 +636,10 @@ void led_boot_mark_dirty() {
 
 uint32_t led_completed_frame_count() {
     return led_completed_frames.load(std::memory_order_relaxed);
+}
+
+void led_record_midi_arrival_unlocked(uint32_t arrival_us) {
+    if (arrival_us != 0 && pending_midi_first_arrival_us == 0) {
+        pending_midi_first_arrival_us = arrival_us;
+    }
 }

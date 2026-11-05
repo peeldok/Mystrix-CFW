@@ -1,4 +1,5 @@
 #include "midi.h"
+#include "perf_diag.h"
 
 #include <atomic>
 #include <cstring>
@@ -118,6 +119,7 @@ static const char *usb_string_descriptors[] = {
 struct UsbMidiPacket {
     uint8_t port;
     uint8_t data[4];
+    uint32_t arrival_us;  // ESP time captured when USB MIDI packet is drained
 };
 
 static QueueHandle_t midi_rx_queue = nullptr;
@@ -134,6 +136,7 @@ static constexpr int64_t MIDI_PARSE_BUDGET_US = 750;
 static RGB staged_note_colors[NUM_LEDS]{};
 static uint8_t staged_note_mask[NUM_LEDS]{};
 static bool staged_note_dirty = false;
+static uint32_t staged_first_arrival_us = 0;
 
 static void flush_note_batch() {
     if (!staged_note_dirty) return;
@@ -143,8 +146,11 @@ static void flush_note_batch() {
         led_set_pixel_unlocked(i, staged_note_colors[i]);
         staged_note_mask[i] = 0;
     }
+    led_record_midi_arrival_unlocked(staged_first_arrival_us);
     led_end_update(true);
     staged_note_dirty = false;
+    staged_first_arrival_us = 0;
+    perf_diag_note_batch_flushed();
 }
 
 static constexpr size_t SYSEX_BUFFER_SIZE = 1024;
@@ -181,6 +187,8 @@ extern "C" void tud_midi_rx_cb(uint8_t itf) {
     packet.port = itf;
 
     while (tud_midi_n_packet_read(itf, packet.data)) {
+        packet.arrival_us = static_cast<uint32_t>(esp_timer_get_time());
+        perf_diag_usb_arrival(packet.arrival_us);
         enqueue_rx_drop_oldest(packet);
     }
 }
@@ -210,7 +218,7 @@ void midi_queue_button(uint8_t note, bool pressed, uint8_t velocity) {
     xQueueSend(button_queue, &ev, 0);
 }
 
-static void handle_note(uint8_t status, uint8_t note, uint8_t velocity) {
+static void handle_note(uint8_t status, uint8_t note, uint8_t velocity, uint32_t arrival_us) {
     const uint8_t type = status & 0xF0;
     const uint8_t channel = status & 0x0F;
 
@@ -221,6 +229,8 @@ static void handle_note(uint8_t status, uint8_t note, uint8_t velocity) {
     const int idx = drum_pitch_to_led(note);
     if (idx < 0 || idx >= NUM_LEDS) return;
 
+    if (!staged_note_dirty) staged_first_arrival_us = arrival_us;
+    if (staged_note_mask[idx]) perf_diag_note_rewrite();
     staged_note_colors[idx] = is_note_off
         ? RGB{0, 0, 0}
         : palette_color(channel, velocity);
@@ -395,7 +405,7 @@ static uint8_t cin_data_length(uint8_t cin) {
     }
 }
 
-static void process_usb_packet(uint8_t port, const uint8_t packet[4]) {
+static void process_usb_packet(uint8_t port, const uint8_t packet[4], uint32_t arrival_us) {
     if (port >= MIDI_PORT_COUNT) return;
 
     const uint8_t cin = packet[0] & 0x0F;
@@ -419,7 +429,7 @@ static void process_usb_packet(uint8_t port, const uint8_t packet[4]) {
 
     const uint8_t status = packet[1];
     if ((status & 0xF0) == 0x80 || (status & 0xF0) == 0x90) {
-        handle_note(status, packet[2], packet[3]);
+        handle_note(status, packet[2], packet[3], arrival_us);
     }
 }
 
@@ -434,7 +444,10 @@ static void midi_parser_task(void *) {
             const int64_t batch_start_us = esp_timer_get_time();
             uint32_t processed = 0;
             do {
-                process_usb_packet(packet.port, packet.data);
+                perf_diag_midi_queue_wait(
+                    static_cast<uint32_t>(esp_timer_get_time()) - packet.arrival_us
+                );
+                process_usb_packet(packet.port, packet.data, packet.arrival_us);
                 ++processed;
                 // Limit processing time to avoid monopolizing core 1.
                 if (processed >= MIDI_PARSE_BATCH_LIMIT ||
@@ -460,6 +473,7 @@ static void midi_parser_task(void *) {
             last_drop_count = drop_count;
             parsed_in_window = 0;
             stats_start_us = now_us;
+            perf_diag_log_snapshot();
         }
     }
 }

@@ -1,8 +1,8 @@
-name: Mystrix CFW LED DMA512 Bench UF2
+name: Mystrix CFW Sub-ms MIDI and LED Peak Diagnostics
 on:
   push:
     branches:
-      - diag/led-dma512-benchmark-20261105
+      - diag/usb-led-peak-20261105
   workflow_dispatch:
 jobs:
   uf2:
@@ -20,10 +20,10 @@ jobs:
           . /opt/esp/idf/export.sh
           idf.py set-target esp32s3
           idf.py build
-          python3 tools/generate_mystrix_uf2.py build/Mystrix_CFW.bin build/Mystrix-CFW-1.0.1-3ms-CDC-DMA512-BENCH.uf2
+          python3 tools/generate_mystrix_uf2.py build/Mystrix_CFW.bin build/Mystrix-CFW-1.0.1-3ms-CDC-PEAKDIAG.uf2
       - name: Upload DFU UF2
         uses: actions/upload-artifact@v4
         with:
-          name: Mystrix-CFW-1.0.1-3ms-CDC-DMA512-BENCH-DFU
-          path: build/Mystrix-CFW-1.0.1-3ms-CDC-DMA512-BENCH.uf2
+          name: Mystrix-CFW-1.0.1-3ms-CDC-PEAKDIAG-DFU
+          path: build/Mystrix-CFW-1.0.1-3ms-CDC-PEAKDIAG.uf2
           if-no-files-found: error
