@@ -18,7 +18,9 @@ static constexpr uint32_t DEBOUNCE_US = 5000;
 static constexpr uint16_t USB_VID = 0xA006;
 static constexpr uint16_t USB_PID = 0x2E71;
 
-static constexpr uint16_t LED_TARGET_FPS = 200;
-static constexpr uint32_t LED_FRAME_INTERVAL_MS = 1000 / LED_TARGET_FPS;
-static constexpr uint16_t MIDI_RX_QUEUE_SIZE = 128;
-static constexpr uint16_t MIDI_TX_QUEUE_SIZE = 128;
+static constexpr uint16_t LED_TARGET_FPS = 300;
+static constexpr uint32_t LED_FRAME_INTERVAL_US = 1000000UL / LED_TARGET_FPS;
+static constexpr uint16_t MIDI_RX_QUEUE_SIZE = 256;
+static constexpr uint16_t MIDI_TX_QUEUE_SIZE = 256;
+static constexpr uint16_t MIDI_RX_FIFO_BYTES = 128;
+static constexpr uint16_t MIDI_TX_FIFO_BYTES = 128;

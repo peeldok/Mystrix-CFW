@@ -11,6 +11,7 @@
 #include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -33,6 +34,12 @@ static std::atomic<uint8_t> settings_matrix_brightness_state{255};
 static std::atomic<uint8_t> settings_side_brightness_state{255};
 static rmt_channel_handle_t rmt_channel = nullptr;
 static rmt_encoder_handle_t rmt_encoder = nullptr;
+static TaskHandle_t led_task_handle = nullptr;
+static esp_timer_handle_t led_periodic_timer = nullptr;
+
+static void led_timer_callback(void *arg) {
+    xTaskNotifyGive(static_cast<TaskHandle_t>(arg));
+}
 
 typedef struct {
     rmt_encoder_t base;
@@ -281,8 +288,6 @@ static bool prepare_latest_frame() {
 }
 
 static void led_task(void *) {
-    TickType_t last_wake = xTaskGetTickCount();
-    const TickType_t period = pdMS_TO_TICKS(LED_FRAME_INTERVAL_MS);
 
     const rmt_transmit_config_t tx_cfg = {
         .loop_count = 0,
@@ -293,7 +298,7 @@ static void led_task(void *) {
     };
 
     for (;;) {
-        vTaskDelayUntil(&last_wake, period);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         if (!led_dirty.load(std::memory_order_acquire)) {
             continue;
@@ -359,19 +364,41 @@ void led_init() {
         return;
     }
 
-    xTaskCreatePinnedToCore(
+    const BaseType_t task_created = xTaskCreatePinnedToCore(
         led_task,
-        "led_200fps",
+        "led_refresh",
         4096,
         nullptr,
         5,
-        nullptr,
+        &led_task_handle,
         0
     );
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create LED refresh task");
+        return;
+    }
+
+    esp_timer_create_args_t timer_args = {};
+    timer_args.callback = led_timer_callback;
+    timer_args.arg = led_task_handle;
+    timer_args.dispatch_method = ESP_TIMER_TASK;
+    timer_args.name = "led_300fps";
+
+    err = esp_timer_create(&timer_args, &led_periodic_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_timer_create failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = esp_timer_start_periodic(led_periodic_timer, LED_FRAME_INTERVAL_US);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_timer_start_periodic failed: %s", esp_err_to_name(err));
+        return;
+    }
 
     led_fill({0, 0, 0});
     led_mark_dirty();
-    ESP_LOGI(TAG, "RMT DMA LED driver started at target %u FPS", LED_TARGET_FPS);
+    ESP_LOGI(TAG, "RMT DMA LED driver started at target %u FPS (%lu us period)",
+             LED_TARGET_FPS, static_cast<unsigned long>(LED_FRAME_INTERVAL_US));
 }
 
 void led_set_pixel(int index, RGB color) {

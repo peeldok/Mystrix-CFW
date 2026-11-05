@@ -1,0 +1,31 @@
+name: Mystrix CFW 300FPS MIDI2x UF2
+on:
+  push:
+    branches:
+      - build/300fps-midi2x-20261105
+  workflow_dispatch:
+jobs:
+  uf2:
+    runs-on: ubuntu-24.04
+    container:
+      image: espressif/idf:v5.3.3
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile ESP32-S3 and build app-only UF2
+        shell: bash
+        run: |
+          set -euo pipefail
+          idf.py set-target esp32s3
+          idf.py build
+          idf.py uf2-app
+          test -s build/uf2-app.bin
+          cp build/uf2-app.bin build/Mystrix-CFW-1.0.1-300FPS-MIDI2x.uf2
+          ls -lh build/Mystrix-CFW-1.0.1-300FPS-MIDI2x.uf2
+      - name: Upload UF2 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mystrix-CFW-1.0.1-300FPS-MIDI2x
+          path: build/Mystrix-CFW-1.0.1-300FPS-MIDI2x.uf2
+          if-no-files-found: error
