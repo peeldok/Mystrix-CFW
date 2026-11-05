@@ -440,7 +440,9 @@ static void led_task(void *) {
 
 void led_perf_log_snapshot() {
     static uint32_t last_completed = 0;
-    static int64_t last_us = esp_timer_get_time();
+    // First snapshot measures from boot (esp_timer epoch), not from the
+    // first call to this function; avoids a near-zero first interval.
+    static int64_t last_us = 0;
     const int64_t now_us = esp_timer_get_time();
     const int64_t elapsed = now_us - last_us;
     if (elapsed <= 0) return;
