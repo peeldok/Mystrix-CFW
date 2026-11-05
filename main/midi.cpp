@@ -135,6 +135,9 @@ static std::atomic<uint32_t> parsed_rx_packets{0};
 // processing or LED-frame issue, without printing from real-time tasks.
 static std::atomic<uint32_t> raw_note_on{0};
 static std::atomic<uint32_t> raw_note_off{0};
+static std::atomic<uint32_t> raw_other_packets{0};
+static std::atomic<uint32_t> note_packets_port0{0};
+static std::atomic<uint32_t> note_packets_port1{0};
 static std::atomic<uint32_t> parsed_note_on{0};
 static std::atomic<uint32_t> parsed_note_off{0};
 static std::atomic<uint32_t> ignored_pitch_events{0};
@@ -204,12 +207,22 @@ extern "C" void tud_midi_rx_cb(uint8_t itf) {
         const uint8_t status_group = packet.data[1] & 0xF0;
         if ((cin == 0x08 || cin == 0x09) &&
             (status_group == 0x80 || status_group == 0x90)) {
+            // Publish the arrival timestamp BEFORE incrementing counters.
+            // This prevents a stats snapshot from seeing a new Note count
+            // with an old last-note timestamp during concurrent USB receive.
+            last_note_arrival_us.store(packet.arrival_us, std::memory_order_release);
             if (status_group == 0x90 && packet.data[3] != 0) {
                 raw_note_on.fetch_add(1, std::memory_order_relaxed);
             } else {
                 raw_note_off.fetch_add(1, std::memory_order_relaxed);
             }
-            last_note_arrival_us.store(packet.arrival_us, std::memory_order_relaxed);
+            if (itf == 0) {
+                note_packets_port0.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                note_packets_port1.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            raw_other_packets.fetch_add(1, std::memory_order_relaxed);
         }
         perf_diag_usb_arrival(packet.arrival_us);
         enqueue_rx_drop_oldest(packet);
@@ -523,19 +536,30 @@ static void midi_stats_task(void *) {
         // Emit a single summary after 1 second of complete MIDI inactivity.
         // This is deliberately NOT sampled in the MIDI callback or LED task.
         static uint32_t last_reported_total = 0;
-        static uint32_t prev_rx_on = 0, prev_rx_off = 0;
+        static uint32_t prev_rx_on = 0, prev_rx_off = 0, prev_other = 0;
+        static uint32_t prev_port0 = 0, prev_port1 = 0;
         static uint32_t prev_parsed_on = 0, prev_parsed_off = 0, prev_ignored = 0;
         const uint32_t rx_on = raw_note_on.load(std::memory_order_relaxed);
         const uint32_t rx_off = raw_note_off.load(std::memory_order_relaxed);
         const uint32_t total = rx_on + rx_off;
-        const uint32_t last_arrival_us = last_note_arrival_us.load(std::memory_order_relaxed);
-        const uint32_t idle_duration_us =
-            static_cast<uint32_t>(now_us) - last_arrival_us;
+        const uint32_t last_arrival_us = last_note_arrival_us.load(std::memory_order_acquire);
+        // IMPORTANT: use a FRESH time reading AFTER last_arrival_us.
+        // The old logic used now_us captured before the stats logs were sent,
+        // and did an unsigned subtraction. A newly received Note therefore
+        // underflowed to ~4294 seconds of "idle", splitting one playback into
+        // several fake SESSION reports.
+        const uint32_t idle_now_us = static_cast<uint32_t>(esp_timer_get_time());
+        const int32_t idle_duration_us =
+            static_cast<int32_t>(idle_now_us - last_arrival_us);
         if (last_arrival_us != 0 && total > last_reported_total &&
-            idle_duration_us >= 1000000U) {
+            idle_duration_us >= 1000000 &&
+            last_arrival_us == last_note_arrival_us.load(std::memory_order_acquire)) {
             const uint32_t p_on = parsed_note_on.load(std::memory_order_relaxed);
             const uint32_t p_off = parsed_note_off.load(std::memory_order_relaxed);
             const uint32_t ignored = ignored_pitch_events.load(std::memory_order_relaxed);
+            const uint32_t other = raw_other_packets.load(std::memory_order_relaxed);
+            const uint32_t port0 = note_packets_port0.load(std::memory_order_relaxed);
+            const uint32_t port1 = note_packets_port1.load(std::memory_order_relaxed);
             uint32_t active_pitch_count = 0;
             for (const auto &pitch : note_state) {
                 active_pitch_count += pitch.load(std::memory_order_relaxed) != 0;
@@ -544,18 +568,25 @@ static void midi_stats_task(void *) {
             const uint32_t queue_remaining =
                 midi_rx_queue ? uxQueueMessagesWaiting(midi_rx_queue) : 0;
             ESP_LOGI("tail",
-                "SESSION RX_on=%lu RX_off=%lu RX_total=%lu parsed_on=%lu parsed_off=%lu ignored=%lu active_pitches=%lu framebuffer_lit=%lu pending_queue=%lu",
+                "SESSION RX_on=%lu RX_off=%lu RX_total=%lu other_usb=%lu port0=%lu port1=%lu parsed_on=%lu parsed_off=%lu ignored=%lu active_pitches=%lu framebuffer_lit=%lu pending_queue=%lu idle_ms=%lu",
                 static_cast<unsigned long>(rx_on - prev_rx_on),
                 static_cast<unsigned long>(rx_off - prev_rx_off),
                 static_cast<unsigned long>(total - last_reported_total),
+                static_cast<unsigned long>(other - prev_other),
+                static_cast<unsigned long>(port0 - prev_port0),
+                static_cast<unsigned long>(port1 - prev_port1),
                 static_cast<unsigned long>(p_on - prev_parsed_on),
                 static_cast<unsigned long>(p_off - prev_parsed_off),
                 static_cast<unsigned long>(ignored - prev_ignored),
                 static_cast<unsigned long>(active_pitch_count),
                 static_cast<unsigned long>(lit_count),
-                static_cast<unsigned long>(queue_remaining)
+                static_cast<unsigned long>(queue_remaining),
+                static_cast<unsigned long>(idle_duration_us / 1000)
             );
             last_reported_total = total;
+            prev_other = other;
+            prev_port0 = port0;
+            prev_port1 = port1;
             prev_rx_on = rx_on;
             prev_rx_off = rx_off;
             prev_parsed_on = p_on;

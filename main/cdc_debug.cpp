@@ -134,7 +134,7 @@ void cdc_debug_init() {
     // ROM/boot logs remain available on UART before this point. Runtime ESP-IDF
     // logs are routed only to the low-priority CDC worker to avoid UART stalls.
     esp_log_set_vprintf(async_debug_vprintf);
-    ESP_LOGI("cdc_debug", "Async CDC diagnostics: B=LED benchmark; P=blackout; TAIL note counts after 1s idle");
+    ESP_LOGI("cdc_debug", "Async CDC diagnostics: B=LED benchmark; P=blackout; TAIL after verified 1s idle");
 }
 
 void cdc_debug_rx_callback(int itf, cdcacm_event_t *event) {
