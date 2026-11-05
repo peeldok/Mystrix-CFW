@@ -1,0 +1,38 @@
+name: Mystrix Vendor Bulk Native ESP-IDF Build
+on:
+  push:
+    branches:
+      - feat/vendor-bulk-midi-20261105
+    paths:
+      - ".github/workflows/build-mystrix-uf2-native.yml"
+      - "main/**"
+      - "sdkconfig.defaults"
+      - "cmake/**"
+  workflow_dispatch:
+jobs:
+  uf2-native:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ESP-IDF 5.3.3 toolchain natively
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --branch v5.3.3 --depth 1 --recurse-submodules --shallow-submodules https://github.com/espressif/esp-idf.git "$RUNNER_TEMP/esp-idf"
+          "$RUNNER_TEMP/esp-idf/install.sh" esp32s3
+      - name: Compile ESP32-S3 and create UF2
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/esp-idf/export.sh"
+          idf.py set-target esp32s3
+          idf.py build
+          python3 tools/generate_mystrix_uf2.py build/Mystrix_CFW.bin build/Mystrix-CFW-1.0.1-VENDOR-BULK.uf2
+      - name: Upload compiled Vendor Bulk UF2
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mystrix-CFW-1.0.1-VENDOR-BULK-DFU
+          path: build/Mystrix-CFW-1.0.1-VENDOR-BULK.uf2
+          if-no-files-found: error
