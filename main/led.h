@@ -37,3 +37,6 @@ void led_record_midi_arrival_unlocked(uint32_t arrival_us);
 
 // Called only from the low-priority metrics task (never from the LED task).
 void led_perf_log_snapshot();
+
+// Snapshot of logical RGB framebuffer; UINT32_MAX if mutex unavailable.
+uint32_t led_debug_lit_count();

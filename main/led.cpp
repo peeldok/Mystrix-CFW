@@ -652,3 +652,16 @@ void led_record_midi_arrival_unlocked(uint32_t arrival_us) {
         pending_midi_first_arrival_us = arrival_us;
     }
 }
+
+uint32_t led_debug_lit_count() {
+    if (framebuffer_mutex == nullptr ||
+        xSemaphoreTake(framebuffer_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return UINT32_MAX;  // Debug-only sentinel if lock isn't available.
+    }
+    uint32_t lit = 0;
+    for (const auto &pixel : framebuffer) {
+        if (pixel.r != 0 || pixel.g != 0 || pixel.b != 0) ++lit;
+    }
+    xSemaphoreGive(framebuffer_mutex);
+    return lit;
+}

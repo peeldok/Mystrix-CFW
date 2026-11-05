@@ -129,6 +129,17 @@ static std::atomic<uint32_t> received_rx_packets{0};
 static std::atomic<uint32_t> rx_queue_peak{0};
 static uint32_t dropped_tx_events = 0;
 static std::atomic<uint32_t> parsed_rx_packets{0};
+
+// The recorder provided a 4s capture with precisely 8377 NoteOn + 8377 NoteOff.
+// Counters below let us distinguish a PC/USB delivery loss from a firmware
+// processing or LED-frame issue, without printing from real-time tasks.
+static std::atomic<uint32_t> raw_note_on{0};
+static std::atomic<uint32_t> raw_note_off{0};
+static std::atomic<uint32_t> parsed_note_on{0};
+static std::atomic<uint32_t> parsed_note_off{0};
+static std::atomic<uint32_t> ignored_pitch_events{0};
+static std::atomic<uint32_t> last_note_arrival_us{0};
+static std::atomic<uint8_t> note_state[128]{};
 static constexpr uint32_t MIDI_PARSE_BATCH_LIMIT = 192;
 static constexpr int64_t MIDI_PARSE_BUDGET_US = 750;
 
@@ -189,6 +200,17 @@ extern "C" void tud_midi_rx_cb(uint8_t itf) {
 
     while (tud_midi_n_packet_read(itf, packet.data)) {
         packet.arrival_us = static_cast<uint32_t>(esp_timer_get_time());
+        const uint8_t cin = packet.data[0] & 0x0F;
+        const uint8_t status_group = packet.data[1] & 0xF0;
+        if ((cin == 0x08 || cin == 0x09) &&
+            (status_group == 0x80 || status_group == 0x90)) {
+            if (status_group == 0x90 && packet.data[3] != 0) {
+                raw_note_on.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                raw_note_off.fetch_add(1, std::memory_order_relaxed);
+            }
+            last_note_arrival_us.store(packet.arrival_us, std::memory_order_relaxed);
+        }
         perf_diag_usb_arrival(packet.arrival_us);
         enqueue_rx_drop_oldest(packet);
     }
@@ -227,8 +249,19 @@ static void handle_note(uint8_t status, uint8_t note, uint8_t velocity, uint32_t
     const bool is_note_off = type == 0x80 || (type == 0x90 && velocity == 0);
     if (!is_note_on && !is_note_off) return;
 
+    if (is_note_on) {
+        parsed_note_on.fetch_add(1, std::memory_order_relaxed);
+        note_state[note].store(1, std::memory_order_relaxed);
+    } else {
+        parsed_note_off.fetch_add(1, std::memory_order_relaxed);
+        note_state[note].store(0, std::memory_order_relaxed);
+    }
+
     const int idx = drum_pitch_to_led(note);
-    if (idx < 0 || idx >= NUM_LEDS) return;
+    if (idx < 0 || idx >= NUM_LEDS) {
+        ignored_pitch_events.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
 
     if (!staged_note_dirty) staged_first_arrival_us = arrival_us;
     if (staged_note_mask[idx]) perf_diag_note_rewrite();
@@ -486,6 +519,49 @@ static void midi_stats_task(void *) {
 
         perf_diag_log_snapshot();
         led_perf_log_snapshot();
+
+        // Emit a single summary after 1 second of complete MIDI inactivity.
+        // This is deliberately NOT sampled in the MIDI callback or LED task.
+        static uint32_t last_reported_total = 0;
+        static uint32_t prev_rx_on = 0, prev_rx_off = 0;
+        static uint32_t prev_parsed_on = 0, prev_parsed_off = 0, prev_ignored = 0;
+        const uint32_t rx_on = raw_note_on.load(std::memory_order_relaxed);
+        const uint32_t rx_off = raw_note_off.load(std::memory_order_relaxed);
+        const uint32_t total = rx_on + rx_off;
+        const uint32_t last_arrival_us = last_note_arrival_us.load(std::memory_order_relaxed);
+        const uint32_t idle_duration_us =
+            static_cast<uint32_t>(now_us) - last_arrival_us;
+        if (last_arrival_us != 0 && total > last_reported_total &&
+            idle_duration_us >= 1000000U) {
+            const uint32_t p_on = parsed_note_on.load(std::memory_order_relaxed);
+            const uint32_t p_off = parsed_note_off.load(std::memory_order_relaxed);
+            const uint32_t ignored = ignored_pitch_events.load(std::memory_order_relaxed);
+            uint32_t active_pitch_count = 0;
+            for (const auto &pitch : note_state) {
+                active_pitch_count += pitch.load(std::memory_order_relaxed) != 0;
+            }
+            const uint32_t lit_count = led_debug_lit_count();
+            const uint32_t queue_remaining =
+                midi_rx_queue ? uxQueueMessagesWaiting(midi_rx_queue) : 0;
+            ESP_LOGI("tail",
+                "SESSION RX_on=%lu RX_off=%lu RX_total=%lu parsed_on=%lu parsed_off=%lu ignored=%lu active_pitches=%lu framebuffer_lit=%lu pending_queue=%lu",
+                static_cast<unsigned long>(rx_on - prev_rx_on),
+                static_cast<unsigned long>(rx_off - prev_rx_off),
+                static_cast<unsigned long>(total - last_reported_total),
+                static_cast<unsigned long>(p_on - prev_parsed_on),
+                static_cast<unsigned long>(p_off - prev_parsed_off),
+                static_cast<unsigned long>(ignored - prev_ignored),
+                static_cast<unsigned long>(active_pitch_count),
+                static_cast<unsigned long>(lit_count),
+                static_cast<unsigned long>(queue_remaining)
+            );
+            last_reported_total = total;
+            prev_rx_on = rx_on;
+            prev_rx_off = rx_off;
+            prev_parsed_on = p_on;
+            prev_parsed_off = p_off;
+            prev_ignored = ignored;
+        }
     }
 }
 

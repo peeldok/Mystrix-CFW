@@ -134,7 +134,7 @@ void cdc_debug_init() {
     // ROM/boot logs remain available on UART before this point. Runtime ESP-IDF
     // logs are routed only to the low-priority CDC worker to avoid UART stalls.
     esp_log_set_vprintf(async_debug_vprintf);
-    ESP_LOGI("cdc_debug", "Async CDC diagnostics enabled: UART runtime mirroring OFF; B=LED-only benchmark");
+    ESP_LOGI("cdc_debug", "Async CDC diagnostics: B=LED benchmark; P=blackout; TAIL note counts after 1s idle");
 }
 
 void cdc_debug_rx_callback(int itf, cdcacm_event_t *event) {
@@ -149,6 +149,11 @@ void cdc_debug_rx_callback(int itf, cdcacm_event_t *event) {
             if ((input[i] == 'B' || input[i] == 'b') && benchmark_task_handle) {
                 // CDC callback runs in TinyUSB task context, not an interrupt.
                 xTaskNotifyGive(benchmark_task_handle);
+            } else if (input[i] == 'P' || input[i] == 'p') {
+                // Manual emergency blackout; intentionally not automatic so
+                // sustained/intentional static MIDI lighting is not interrupted.
+                led_fill({0, 0, 0});
+                ESP_LOGI("tail", "PANIC: all 96 logical LEDs set black; RMT refresh requested");
             }
         }
     } while (got == sizeof(input));
