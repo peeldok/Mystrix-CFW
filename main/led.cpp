@@ -42,6 +42,10 @@ static TaskHandle_t led_task_handle = nullptr;
 static esp_timer_handle_t led_pacing_timer = nullptr;
 static std::atomic<bool> led_rmt_busy{false};
 static std::atomic<uint32_t> led_completed_frames{0};
+static std::atomic<uint32_t> rmt_start_us{0};
+static std::atomic<uint32_t> rmt_duration_sum_us{0};
+static std::atomic<uint32_t> rmt_duration_max_us{0};
+static std::atomic<uint32_t> rmt_duration_samples{0};
 
 static void led_timer_callback(void *arg) {
     xTaskNotifyGive(static_cast<TaskHandle_t>(arg));
@@ -55,6 +59,13 @@ static bool IRAM_ATTR led_on_rmt_done(
     (void)channel;
     (void)edata;
     (void)user_data;
+    const uint32_t finished_us = static_cast<uint32_t>(esp_timer_get_time());
+    const uint32_t elapsed_us = finished_us - rmt_start_us.load(std::memory_order_relaxed);
+    rmt_duration_sum_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+    rmt_duration_samples.fetch_add(1, std::memory_order_relaxed);
+    uint32_t peak = rmt_duration_max_us.load(std::memory_order_relaxed);
+    while (elapsed_us > peak && !rmt_duration_max_us.compare_exchange_weak(
+        peak, elapsed_us, std::memory_order_relaxed)) {}
     led_rmt_busy.store(false, std::memory_order_release);
     led_completed_frames.fetch_add(1, std::memory_order_relaxed);
     BaseType_t wake = pdFALSE;
@@ -352,10 +363,15 @@ static void led_task(void *) {
             const uint32_t done = led_completed_frames.load(std::memory_order_relaxed);
             const uint32_t completed = done - last_completed;
             const int64_t elapsed = now - stats_start_us;
-            ESP_LOGI(TAG, "PERF LED done_fps=%lu prepared=%lu avg_prepare_us=%lu tx_err=%lu",
+            const uint32_t sum_us = rmt_duration_sum_us.exchange(0, std::memory_order_relaxed);
+            const uint32_t max_us = rmt_duration_max_us.exchange(0, std::memory_order_relaxed);
+            const uint32_t samples = rmt_duration_samples.exchange(0, std::memory_order_relaxed);
+            ESP_LOGI(TAG, "PERF LED done_fps=%lu prepared=%lu avg_prepare_us=%lu rmt_avg_us=%lu rmt_max_us=%lu tx_err=%lu",
                 static_cast<unsigned long>((static_cast<uint64_t>(completed) * 1000000ULL) / elapsed),
                 static_cast<unsigned long>(prepare_count),
                 static_cast<unsigned long>(prepare_count ? prepare_total_us / prepare_count : 0),
+                static_cast<unsigned long>(samples ? sum_us / samples : 0),
+                static_cast<unsigned long>(max_us),
                 static_cast<unsigned long>(tx_errors));
             last_completed = done;
             prepare_count = 0;
@@ -385,6 +401,7 @@ static void led_task(void *) {
         ++prepare_count;
         prepare_total_us += esp_timer_get_time() - prepare_start;
 
+        rmt_start_us.store(static_cast<uint32_t>(esp_timer_get_time()), std::memory_order_relaxed);
         led_rmt_busy.store(true, std::memory_order_release);
         const esp_err_t err = rmt_transmit(
             rmt_channel,
@@ -582,4 +599,8 @@ void led_boot_fill(RGB color) {
 void led_boot_mark_dirty() {
     led_dirty.store(true, std::memory_order_release);
     notify_led_task();
+}
+
+uint32_t led_completed_frame_count() {
+    return led_completed_frames.load(std::memory_order_relaxed);
 }

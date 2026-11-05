@@ -499,7 +499,7 @@ void midi_init() {
 
     const tinyusb_config_cdcacm_t acm_cfg = {
         .cdc_port = TINYUSB_CDC_ACM_0,
-        .callback_rx = nullptr,
+        .callback_rx = cdc_debug_rx_callback,
         .callback_rx_wanted_char = nullptr,
         .callback_line_state_changed = nullptr,
         .callback_line_coding_changed = nullptr,

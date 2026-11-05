@@ -29,3 +29,5 @@ void led_boot_end();
 void led_boot_set_pixel(int index, RGB color);
 void led_boot_fill(RGB color);
 void led_boot_mark_dirty();
+
+uint32_t led_completed_frame_count();

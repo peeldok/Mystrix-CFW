@@ -3,6 +3,10 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+#include "esp_timer.h"
+#include "led.h"
+#include "tinyusb_cdc_acm.h"
+
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -22,6 +26,39 @@ struct LogLine {
 
 QueueHandle_t log_queue = nullptr;
 vprintf_like_t old_vprintf = nullptr;
+TaskHandle_t benchmark_task_handle = nullptr;
+
+// Triggered only by typing B into the debug COM port.
+// This synthetic test bypasses all MIDI to measure actual LED/RMT capacity.
+void benchmark_task(void *) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ESP_LOGI("bench", "START: 5-second LED-only 3ms stress test, stop MIDI playback first");
+        const uint32_t start_frames = led_completed_frame_count();
+        const int64_t start_us = esp_timer_get_time();
+        TickType_t wake = xTaskGetTickCount();
+        uint32_t updates = 0;
+        while (esp_timer_get_time() - start_us < 5000000LL) {
+            // Color changes on all 96 LEDs force a new 288-byte RMT payload.
+            const RGB color = (updates & 1U) ? RGB{0, 0, 22} : RGB{22, 0, 0};
+            led_fill(color);
+            ++updates;
+            vTaskDelayUntil(&wake, pdMS_TO_TICKS(3));
+        }
+        led_fill({0, 0, 0});
+        // Allow the final in-flight RMT transaction to finish before counting.
+        vTaskDelay(pdMS_TO_TICKS(10));
+        const int64_t elapsed = esp_timer_get_time() - start_us;
+        const uint32_t completed = led_completed_frame_count() - start_frames;
+        const uint32_t measured_fps =
+            static_cast<uint32_t>((static_cast<uint64_t>(completed) * 1000000ULL) / elapsed);
+        ESP_LOGI("bench", "FINISHED: updates=%lu completed=%lu measured_fps=%lu target_fps=333",
+            static_cast<unsigned long>(updates),
+            static_cast<unsigned long>(completed),
+            static_cast<unsigned long>(measured_fps));
+    }
+}
+
 
 int async_debug_vprintf(const char *format, va_list args) {
     // Keep UART log output intact (also useful for recovery/debugging).
@@ -91,6 +128,30 @@ void cdc_debug_init() {
         return;
     }
 
+    const BaseType_t bench_ok = xTaskCreatePinnedToCore(
+        benchmark_task, "led_bench", 4096, nullptr, 2, &benchmark_task_handle, 0
+    );
+    if (bench_ok != pdPASS) {
+        ESP_LOGE("cdc_debug", "Unable to create LED benchmark task");
+    }
+
     old_vprintf = esp_log_set_vprintf(async_debug_vprintf);
-    ESP_LOGI("cdc_debug", "CDC debug available (open new COM at 115200, DTR enabled)");
+    ESP_LOGI("cdc_debug", "CDC debug ready: type B to run 5-second LED-only benchmark (no MIDI playing)");
+}
+
+void cdc_debug_rx_callback(int itf, cdcacm_event_t *event) {
+    (void)itf;
+    (void)event;
+    uint8_t input[64];
+    size_t got = 0;
+    do {
+        got = 0;
+        if (tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, input, sizeof(input), &got) != ESP_OK) break;
+        for (size_t i = 0; i < got; ++i) {
+            if ((input[i] == 'B' || input[i] == 'b') && benchmark_task_handle) {
+                // CDC callback runs in TinyUSB task context, not an interrupt.
+                xTaskNotifyGive(benchmark_task_handle);
+            }
+        }
+    } while (got == sizeof(input));
 }
